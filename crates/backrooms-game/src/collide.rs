@@ -7,16 +7,27 @@
 
 use bevy::math::Vec2;
 
-use crate::space::{CELL, Plan, WALL_HALF};
+use crate::space::{CELL, Plan, WALL_HALF, blocks};
 
 /// Longest distance moved before re-checking for collisions. Must be well
 /// under the wall thickness plus the player radius, or a fast player could
 /// step clean through a wall between two checks.
 const MAX_STEP: f32 = 0.1;
 
-/// Moves a circle of `radius` from `from` by `delta`, sliding along
-/// obstacles. Positions are plan coordinates relative to the plan's base.
-pub fn slide(plan: &impl Plan, from: Vec2, delta: Vec2, radius: f32) -> Vec2 {
+/// The player's body for collision: a circle on the plan, with a height.
+/// The height decides what counts as an obstacle: a crawl hole stops a
+/// standing body and lets a crawling one through.
+#[derive(Clone, Copy, Debug)]
+pub struct Body {
+    pub radius: f32,
+    pub height: f32,
+    /// Ceiling height of the level, which is the clearance of an open edge.
+    pub ceiling: f32,
+}
+
+/// Moves `body` from `from` by `delta`, sliding along obstacles. Positions
+/// are plan coordinates relative to the plan's base.
+pub fn slide(plan: &impl Plan, from: Vec2, delta: Vec2, body: Body) -> Vec2 {
     let steps = (delta.length() / MAX_STEP).ceil().max(1.0) as u32;
     let step = delta / steps as f32;
     let mut pos = from;
@@ -25,14 +36,17 @@ pub fn slide(plan: &impl Plan, from: Vec2, delta: Vec2, radius: f32) -> Vec2 {
         // Being pushed out of one wall can push the circle into another (in
         // a corner), so resolve a few times.
         for _ in 0..3 {
-            pos = push_out(plan, pos, radius);
+            pos = push_out(plan, pos, body);
         }
     }
     pos
 }
 
 /// Pushes the circle out of every obstacle near it, once.
-fn push_out(plan: &impl Plan, mut pos: Vec2, radius: f32) -> Vec2 {
+fn push_out(plan: &impl Plan, mut pos: Vec2, body: Body) -> Vec2 {
+    let radius = body.radius;
+    let solid_ns = |x: i32, y: i32| blocks(plan.slab_ns(x, y), body.height, body.ceiling);
+    let solid_ew = |x: i32, y: i32| blocks(plan.slab_ew(x, y), body.height, body.ceiling);
     let cell = (pos / CELL).floor();
     let (cx, cy) = (cell.x as i32, cell.y as i32);
     // Anything further than one cell away cannot touch a circle smaller than
@@ -48,14 +62,14 @@ fn push_out(plan: &impl Plan, mut pos: Vec2, radius: f32) -> Vec2 {
             // the wall ends, the box gets the same half-thickness cap as the
             // drawn wall.
             let reach = |continues: bool| if continues { CELL } else { WALL_HALF };
-            if plan.wall_ns(x, y) {
-                let min = corner - Vec2::new(WALL_HALF, reach(plan.wall_ns(x, y - 1)));
-                let max = corner + Vec2::new(WALL_HALF, CELL + reach(plan.wall_ns(x, y + 1)));
+            if solid_ns(x, y) {
+                let min = corner - Vec2::new(WALL_HALF, reach(solid_ns(x, y - 1)));
+                let max = corner + Vec2::new(WALL_HALF, CELL + reach(solid_ns(x, y + 1)));
                 pos = push_out_of_box(pos, radius, min, max);
             }
-            if plan.wall_ew(x, y) {
-                let min = corner - Vec2::new(reach(plan.wall_ew(x - 1, y)), WALL_HALF);
-                let max = corner + Vec2::new(CELL + reach(plan.wall_ew(x + 1, y)), WALL_HALF);
+            if solid_ew(x, y) {
+                let min = corner - Vec2::new(reach(solid_ew(x - 1, y)), WALL_HALF);
+                let max = corner + Vec2::new(CELL + reach(solid_ew(x + 1, y)), WALL_HALF);
                 pos = push_out_of_box(pos, radius, min, max);
             }
             if plan.solid(x, y) {
@@ -95,21 +109,37 @@ fn push_out_of_box(pos: Vec2, radius: f32, min: Vec2, max: Vec2) -> Vec2 {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use backrooms_core::Edge;
 
     /// A hand-written floor plan for tests.
     #[derive(Default)]
     pub struct TestPlan {
+        /// Cells with a plain wall on their west side.
         pub west: Vec<(i32, i32)>,
+        /// Cells with a plain wall on their south side.
         pub south: Vec<(i32, i32)>,
         pub pillars: Vec<(i32, i32)>,
+        /// Cells whose west side has a window, or a crawl hole.
+        pub west_windows: Vec<(i32, i32)>,
+        pub west_crawls: Vec<(i32, i32)>,
+        /// Lattice points that are out of true, and by how many metres.
+        pub skews: Vec<((i32, i32), Vec2)>,
     }
 
     impl Plan for TestPlan {
-        fn edge_west(&self, x: i32, y: i32) -> bool {
-            self.west.contains(&(x, y))
+        fn west(&self, x: i32, y: i32) -> Edge {
+            if self.west_windows.contains(&(x, y)) {
+                Edge::Window
+            } else if self.west_crawls.contains(&(x, y)) {
+                Edge::Crawl
+            } else if self.west.contains(&(x, y)) {
+                Edge::Wall
+            } else {
+                Edge::Open
+            }
         }
-        fn edge_south(&self, x: i32, y: i32) -> bool {
-            self.south.contains(&(x, y))
+        fn south(&self, x: i32, y: i32) -> Edge {
+            if self.south.contains(&(x, y)) { Edge::Wall } else { Edge::Open }
         }
         fn solid(&self, x: i32, y: i32) -> bool {
             self.pillars.contains(&(x, y))
@@ -117,9 +147,14 @@ pub mod tests {
         fn condition(&self, _: i32, _: i32) -> Vec2 {
             Vec2::ZERO
         }
+        fn skew(&self, x: i32, y: i32) -> Vec2 {
+            self.skews.iter().find(|(at, _)| *at == (x, y)).map_or(Vec2::ZERO, |&(_, push)| push)
+        }
     }
 
-    const R: f32 = 0.22;
+    /// A standing player.
+    const R: Body = Body { radius: 0.22, height: 1.75, ceiling: 2.6 };
+    const RADIUS: f32 = R.radius;
 
     #[test]
     fn open_floor_does_not_interfere() {
@@ -133,7 +168,7 @@ pub mod tests {
         let plan = TestPlan { west: (-10..10).map(|y| (4, y)).collect(), ..Default::default() };
         let end = slide(&plan, Vec2::new(1.0, 0.25), Vec2::new(3.0, 1.0), R);
         // Stopped at the wall face, but the northward part of the move went through.
-        assert!((end.x - (2.0 - WALL_HALF - R)).abs() < 1e-3, "x = {}", end.x);
+        assert!((end.x - (2.0 - WALL_HALF - RADIUS)).abs() < 1e-3, "x = {}", end.x);
         assert!((end.y - 1.25).abs() < 1e-3, "y = {}", end.y);
     }
 
@@ -145,7 +180,7 @@ pub mod tests {
         for _ in 0..600 {
             pos = slide(&plan, pos, Vec2::new(0.02, 0.02), R);
         }
-        assert!((pos.x - (2.0 - WALL_HALF - R)).abs() < 1e-3, "x = {}", pos.x);
+        assert!((pos.x - (2.0 - WALL_HALF - RADIUS)).abs() < 1e-3, "x = {}", pos.x);
         assert!((pos.y - 12.25).abs() < 1e-2, "y = {}", pos.y);
     }
 
@@ -180,25 +215,60 @@ pub mod tests {
             ..Default::default()
         };
         let end = slide(&plan, Vec2::new(1.0, 1.0), Vec2::new(-5.0, -5.0), R);
-        let limit = WALL_HALF + R;
+        let limit = WALL_HALF + RADIUS;
         assert!((end.x - limit).abs() < 1e-3 && (end.y - limit).abs() < 1e-3, "ended at {end}");
     }
 
     #[test]
     fn pillars_are_solid_blocks() {
         // The core marks a pillar's edges as walls too; that must not make it fatter.
-        let plan = TestPlan { pillars: vec![(0, 0)], west: vec![(0, 0), (1, 0)], south: vec![(0, 0), (0, 1)] };
+        let plan = TestPlan {
+            pillars: vec![(0, 0)],
+            west: vec![(0, 0), (1, 0)],
+            south: vec![(0, 0), (0, 1)],
+            ..Default::default()
+        };
         let end = slide(&plan, Vec2::new(-2.0, 0.25), Vec2::new(4.0, 0.0), R);
-        assert!((end.x - (0.0 - R)).abs() < 1e-3, "x = {}", end.x);
+        assert!((end.x - (0.0 - RADIUS)).abs() < 1e-3, "x = {}", end.x);
         // Walking past it, just clear of the side, is not blocked.
-        let end = slide(&plan, Vec2::new(-2.0, 0.5 + R + 0.01), Vec2::new(4.0, 0.0), R);
+        let end = slide(&plan, Vec2::new(-2.0, 0.5 + RADIUS + 0.01), Vec2::new(4.0, 0.0), R);
         assert!((end.x - 2.0).abs() < 1e-3, "x = {}", end.x);
+    }
+
+    #[test]
+    fn a_crawl_hole_passes_only_a_crawling_body() {
+        // A long wall on x = 4 with a two-cell crawl hole at y = 0..2.
+        let plan = TestPlan {
+            west: (-10..10).filter(|y| !(0..2).contains(y)).map(|y| (4, y)).collect(),
+            west_crawls: vec![(4, 0), (4, 1)],
+            ..Default::default()
+        };
+        let through = |height: f32| {
+            let body = Body { height, ..R };
+            slide(&plan, Vec2::new(1.0, 0.5), Vec2::new(2.0, 0.0), body).x
+        };
+        assert!(through(1.75) < 2.0, "walked through a crawl hole");
+        assert!(through(1.1) < 2.0, "crouched through a crawl hole");
+        assert!((through(0.6) - 3.0).abs() < 1e-3, "could not crawl through");
+    }
+
+    #[test]
+    fn a_window_stops_everyone() {
+        let plan = TestPlan {
+            west: (-10..10).filter(|y| !(0..2).contains(y)).map(|y| (4, y)).collect(),
+            west_windows: vec![(4, 0), (4, 1)],
+            ..Default::default()
+        };
+        for height in [1.75, 1.1, 0.6] {
+            let end = slide(&plan, Vec2::new(1.0, 0.5), Vec2::new(2.0, 0.0), Body { height, ..R });
+            assert!(end.x < 2.0, "a body {height} m tall went through a window");
+        }
     }
 
     #[test]
     fn starting_inside_a_wall_gets_you_out() {
         let plan = TestPlan { west: vec![(0, 0)], ..Default::default() };
         let end = slide(&plan, Vec2::new(0.01, 0.25), Vec2::ZERO, R);
-        assert!(end.x >= WALL_HALF + R - 1e-3, "still inside at {end}");
+        assert!(end.x >= WALL_HALF + RADIUS - 1e-3, "still inside at {end}");
     }
 }

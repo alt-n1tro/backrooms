@@ -31,8 +31,9 @@ use space::{CELL, ChunkCache, RenderOrigin};
 /// Explore the Backrooms.
 ///
 /// Click to look around. W A S D to walk; tap W twice (or hold Shift) to
-/// sprint; Space to jump. F11 for fullscreen, F3 or ` for frame rate, Escape
-/// to free the mouse.
+/// sprint; Space to jump. C crouches and X crawls (Space gets you back
+/// up). F11 for fullscreen, F3 or ` for frame rate, Escape to free the
+/// mouse.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -57,9 +58,9 @@ struct Args {
     /// How flickering fixtures cast light. `point` is slightly cheaper.
     #[arg(long, value_enum, default_value = "rect")]
     lights: lights::LightKind,
-    /// Size of the 3D picture relative to the window: `auto` (hold it to
-    /// about 1080p worth of pixels) or a number from 0.25 to 1. Lower is
-    /// faster and softer; 1 is native.
+    /// Size of the 3D picture relative to the window: `auto` (adjust it
+    /// while playing to hold 60 frames a second) or a number from 0.25 to
+    /// 1. Lower is faster and softer; 1 is native.
     #[arg(long, default_value = "auto", value_parser = parse_scale)]
     render_scale: RenderScale,
     /// Highest frame rate to run at; 0 for no limit.
@@ -248,7 +249,11 @@ fn main() -> ExitCode {
         .insert_resource(world::ViewDistance(args.view))
         .insert_resource(world::Ceiling(info.ceiling_mm as f32 / 1000.0))
         .add_plugins((
-            screen::ScreenPlugin { scale: args.render_scale, initial_window: UVec2::new(args.size.0, args.size.1) },
+            screen::ScreenPlugin {
+                scale: args.render_scale,
+                initial_window: UVec2::new(args.size.0, args.size.1),
+                adaptive: args.screenshot.is_none(),
+            },
             surface::SurfacePlugin { ceiling: info.ceiling_mm as f32 / 1000.0 },
             lights::LightsPlugin,
             world::WorldPlugin,

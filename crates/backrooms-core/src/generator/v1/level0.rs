@@ -29,14 +29,26 @@
 //!
 //! Every opening is at least 2 cells (1 m) wide. A doorway never straddles a
 //! lattice point, so no wall ever ends in the middle of one.
+//!
+//! # Oddities
+//!
+//! The level copies a building without understanding one. Every complete
+//! 2 m piece of wall rolls a [`Rarity`]: a common roll puts an unglazed
+//! window in its middle metre, an uncommon one a crawl hole. Neither changes
+//! where a walking player can go, so the guarantees above still hold.
+//!
+//! Separately, a slow **wrongness** noise marks out zones where the wall
+//! lattice itself is out of true: each lattice point there is pushed a few
+//! centimetres off its place, so walls stop being parallel.
 
 use super::{level_key, purpose};
 use crate::GeneratorVersion;
-use crate::chunk::{Cell, Chunk, Edge, Fixture, LightState, N};
+use crate::chunk::{Cell, Chunk, Edge, Fixture, LightState, N, Skew};
 use crate::coord::{CHUNK_SIZE, CellPos, ChunkPos, RegionPos};
 use crate::hash::{Key, ONE, Q16, lerp, pct};
 use crate::level::LevelId;
 use crate::noise::Field;
+use crate::rarity::Rarity;
 
 /// Side of a bay in cells.
 pub const BAY: i32 = 4;
@@ -79,6 +91,10 @@ pub struct Params {
     pub damp_floor: Q16,
     /// Same for wear.
     pub wear_floor: Q16,
+    /// Walls go out of true where the wrongness noise rises above this.
+    pub skew_floor: Q16,
+    /// Furthest a lattice point is pushed, per axis, in centimetres.
+    pub skew_cm: u8,
 }
 
 pub const LEVEL_0: Params = Params {
@@ -96,6 +112,8 @@ pub const LEVEL_0: Params = Params {
     blackout: pct(2),
     damp_floor: pct(66),
     wear_floor: pct(50),
+    skew_floor: pct(84),
+    skew_cm: 28,
 };
 
 /// Which way a segment runs.
@@ -125,11 +143,14 @@ struct Gen<'a> {
     restless: Field,
     damp: Field,
     wear: Field,
+    wrongness: Field,
     wall: Key,
     carve: Key,
     pillar: Key,
     fixture: Key,
     region_lighting: Key,
+    feature: Key,
+    skew: Key,
 }
 
 /// 4-bit mask of a segment: bit `b` set means the cell edge `b` cells along
@@ -165,11 +186,15 @@ impl<'a> Gen<'a> {
             damp: field(purpose::DAMP, 5, 4, 5, 12, 560),
             // Wear in 32 m patches.
             wear: field(purpose::WEAR, 6, 4, 4, 10, 520),
+            // 64 m zones where the geometry goes subtly wrong.
+            wrongness: field(purpose::WRONGNESS, 7, 2, 6, 24, 640),
             wall: level_key(level, purpose::WALL),
             carve: level_key(level, purpose::CARVE),
             pillar: level_key(level, purpose::PILLAR),
             fixture: level_key(level, purpose::FIXTURE),
             region_lighting: level_key(level, purpose::REGION_LIGHTING),
+            feature: level_key(level, purpose::FEATURE),
+            skew: level_key(level, purpose::SKEW),
         }
     }
 
@@ -238,6 +263,50 @@ impl<'a> Gen<'a> {
         let roll = self.carve.with_xy(x, y).roll();
         let gap: Mask = 0b11 << roll.below(3);
         if roll.chance(ONE / 2) { (north & !gap, east) } else { (north, east & !gap) }
+    }
+
+    /// What stands on each of the four cell edges of a segment, given its
+    /// final wall mask. This is where a plain wall piece may turn out to
+    /// have a window or a crawl hole in it.
+    fn dress(&self, axis: Axis, x: i32, y: i32, mask: Mask) -> [Edge; 4] {
+        let mut edges = [Edge::Open; 4];
+        for (b, edge) in edges.iter_mut().enumerate() {
+            if mask >> b & 1 != 0 {
+                *edge = Edge::Wall;
+            }
+        }
+        // Only an unbroken piece of wall can carry a feature, and the
+        // feature takes its middle metre. The half-metre of wall left at
+        // each end keeps it clear of any wall meeting this one at a corner.
+        if mask == FULL {
+            let roll = self.feature.with(axis as u64).with_xy(x, y).roll();
+            let feature = match Rarity::of(roll) {
+                Some(Rarity::Common) => Some(Edge::Window),
+                Some(Rarity::Uncommon) => Some(Edge::Crawl),
+                // Rarer tiers are reserved for features still to come.
+                _ => None,
+            };
+            if let Some(feature) = feature {
+                edges[1] = feature;
+                edges[2] = feature;
+            }
+        }
+        edges
+    }
+
+    /// How far the lattice point at cell corner `(x, y)` is out of true.
+    fn skew_at(&self, x: i32, y: i32) -> Skew {
+        let strength = ramp(self.wrongness.sample(x, y), self.p.skew_floor);
+        // Largest push here, in centimetres: none outside a wrong zone,
+        // rising to the full amount at its heart.
+        let reach = (self.p.skew_cm as u32 * strength) >> 16;
+        if reach == 0 {
+            return Skew::default();
+        }
+        let roll = self.skew.with_xy(x, y).roll();
+        // A whole number from -reach to +reach, each equally likely.
+        let push = |roll: crate::hash::Roll| (roll.below(2 * reach + 1) as i32 - reach as i32) as i8;
+        Skew { dx: push(roll), dy: push(roll.next()) }
     }
 
     /// Whether the cell at `(x, y)` is a pillar. Only cells at a 4 m lattice
@@ -344,12 +413,16 @@ pub fn generate(version: GeneratorVersion, params: &Params, level: LevelId, pos:
         for i in -1..BAYS {
             let bay = origin.offset(i * BAY, j * BAY);
             let (north, east) = g.bay_exits(bay.x, bay.y);
-            for b in 0..BAY {
-                if i >= 0 && north >> b & 1 != 0 {
-                    chunk.south[((j + 1) * BAY) as usize][(i * BAY + b) as usize] = Edge::Wall;
+            // The segments are dressed by their own position, not the
+            // bay's, so both chunks sharing a boundary segment agree.
+            let north = g.dress(Axis::EastWest, bay.x, bay.y.wrapping_add(BAY), north);
+            let east = g.dress(Axis::NorthSouth, bay.x.wrapping_add(BAY), bay.y, east);
+            for b in 0..BAY as usize {
+                if i >= 0 {
+                    chunk.south[((j + 1) * BAY) as usize][(i * BAY) as usize + b] = north[b];
                 }
-                if j >= 0 && east >> b & 1 != 0 {
-                    chunk.west[(j * BAY + b) as usize][((i + 1) * BAY) as usize] = Edge::Wall;
+                if j >= 0 {
+                    chunk.west[(j * BAY) as usize + b][((i + 1) * BAY) as usize] = east[b];
                 }
             }
         }
@@ -380,6 +453,14 @@ pub fn generate(version: GeneratorVersion, params: &Params, level: LevelId, pos:
                     chunk.south[y + 1][x] = Edge::Wall;
                 }
             }
+        }
+    }
+
+    // Where the lattice is out of true.
+    for (j, row) in chunk.skew.iter_mut().enumerate() {
+        for (i, skew) in row.iter_mut().enumerate() {
+            let point = origin.offset(i as i32 * BAY, j as i32 * BAY);
+            *skew = g.skew_at(point.x, point.y);
         }
     }
 

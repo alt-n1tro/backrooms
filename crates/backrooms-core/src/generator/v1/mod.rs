@@ -34,6 +34,9 @@ pub mod purpose {
     pub const DAMP: u64 = 9;
     pub const WEAR: u64 = 10;
     pub const REGION_LIGHTING: u64 = 11;
+    pub const FEATURE: u64 = 12;
+    pub const WRONGNESS: u64 = 13;
+    pub const SKEW: u64 = 14;
 }
 
 /// Key for a world-wide decision.

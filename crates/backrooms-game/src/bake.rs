@@ -18,7 +18,7 @@
 
 use std::f32::consts::PI;
 
-use backrooms_core::LightState;
+use backrooms_core::{Edge, LightState};
 use bevy::math::Vec2;
 
 use crate::space::{CELL, Plan, PlanFixture};
@@ -45,12 +45,27 @@ pub const NUDGE: f32 = 0.15;
 /// Number of heights at which a wall is lit, floor to ceiling.
 pub const ROWS: usize = 4;
 
-/// True if nothing on the plan blocks the straight line from `a` to `b`.
+/// How much light gets through each kind of wall piece, as a fraction.
+fn passes(edge: Edge) -> f32 {
+    match edge {
+        Edge::Open => 1.0,
+        Edge::Wall => 0.0,
+        // The opening is rather less than half the wall's height.
+        Edge::Window => 0.4,
+        // A low hole lets a little light spill along the floor.
+        Edge::Crawl => 0.12,
+    }
+}
+
+/// The fraction of light that survives the straight line from `a` to `b`:
+/// 1.0 across open floor, 0.0 if a wall is in the way, something in between
+/// through a window.
 ///
 /// Walls stand on the grid lines, so it is enough to visit each grid line
-/// the segment crosses and ask whether there is a wall at the crossing.
-pub fn visible(plan: &impl Plan, a: Vec2, b: Vec2) -> bool {
+/// the segment crosses and ask what stands at the crossing.
+pub fn transmission(plan: &impl Plan, a: Vec2, b: Vec2) -> f32 {
     let d = b - a;
+    let mut through = 1.0;
 
     // Lines of constant x strictly between the endpoints.
     let (low, high) = (a.x.min(b.x), a.x.max(b.x));
@@ -58,8 +73,12 @@ pub fn visible(plan: &impl Plan, a: Vec2, b: Vec2) -> bool {
     while (k as f32) < high {
         let y = a.y + d.y * (k as f32 - a.x) / d.x;
         let j = y.floor() as i32;
-        if plan.wall_ns(k, j) || plan.solid(k, j) || plan.solid(k - 1, j) {
-            return false;
+        if plan.solid(k, j) || plan.solid(k - 1, j) {
+            return 0.0;
+        }
+        through *= passes(plan.slab_ns(k, j));
+        if through == 0.0 {
+            return 0.0;
         }
         k += 1;
     }
@@ -70,12 +89,16 @@ pub fn visible(plan: &impl Plan, a: Vec2, b: Vec2) -> bool {
     while (k as f32) < high {
         let x = a.x + d.x * (k as f32 - a.y) / d.y;
         let i = x.floor() as i32;
-        if plan.wall_ew(i, k) || plan.solid(i, k) || plan.solid(i, k - 1) {
-            return false;
+        if plan.solid(i, k) || plan.solid(i, k - 1) {
+            return 0.0;
+        }
+        through *= passes(plan.slab_ew(i, k));
+        if through == 0.0 {
+            return 0.0;
         }
         k += 1;
     }
-    true
+    through
 }
 
 /// Computes baked light for one plan.
@@ -117,10 +140,13 @@ impl<'a, P: Plan> Baker<'a, P> {
         for &source in &self.sources {
             let offset = source - at;
             let reach = offset.length_squared() / (RANGE * RANGE);
-            if reach >= 1.0 || !visible(self.plan, at, source) {
+            if reach >= 1.0 {
                 continue;
             }
-            each(offset * CELL, (1.0 - reach) * (1.0 - reach));
+            let through = transmission(self.plan, at, source);
+            if through > 0.0 {
+                each(offset * CELL, through * (1.0 - reach) * (1.0 - reach));
+            }
         }
     }
 
@@ -187,6 +213,26 @@ mod tests {
 
     const H: f32 = 2.6;
 
+    fn lit(plan: &TestPlan, a: Vec2, b: Vec2) -> bool {
+        transmission(plan, a, b) > 0.0
+    }
+
+    #[test]
+    fn windows_and_crawl_holes_let_some_light_through() {
+        let wall = |extra: fn(&mut TestPlan)| {
+            let mut plan = TestPlan { west: vec![(4, -1), (4, 2)], ..Default::default() };
+            extra(&mut plan);
+            transmission(&plan, Vec2::new(1.5, 0.5), Vec2::new(7.5, 0.5))
+        };
+        let open = wall(|_| {});
+        let window = wall(|plan| plan.west_windows = vec![(4, 0), (4, 1)]);
+        let crawl = wall(|plan| plan.west_crawls = vec![(4, 0), (4, 1)]);
+        let solid = wall(|plan| plan.west.extend([(4, 0), (4, 1)]));
+        assert_eq!(open, 1.0);
+        assert_eq!(solid, 0.0);
+        assert!(solid < crawl && crawl < window && window < open, "{crawl} {window}");
+    }
+
     fn fixture(x: i32, y: i32, state: LightState) -> PlanFixture {
         PlanFixture { cell: IVec2::new(x, y), state }
     }
@@ -194,28 +240,33 @@ mod tests {
     #[test]
     fn open_floor_is_visible_and_walls_block() {
         let open = TestPlan::default();
-        assert!(visible(&open, Vec2::new(0.5, 0.5), Vec2::new(9.5, -7.5)));
+        assert!(lit(&open, Vec2::new(0.5, 0.5), Vec2::new(9.5, -7.5)));
 
         // A wall on the line x = 4, from y = 0 to y = 2.
         let wall = TestPlan { west: vec![(4, 0), (4, 1)], ..Default::default() };
-        assert!(!visible(&wall, Vec2::new(1.5, 0.5), Vec2::new(7.5, 1.5)));
-        assert!(!visible(&wall, Vec2::new(7.5, 1.5), Vec2::new(1.5, 0.5)));
+        assert!(!lit(&wall, Vec2::new(1.5, 0.5), Vec2::new(7.5, 1.5)));
+        assert!(!lit(&wall, Vec2::new(7.5, 1.5), Vec2::new(1.5, 0.5)));
         // Past its end the view is clear.
-        assert!(visible(&wall, Vec2::new(1.5, 2.5), Vec2::new(7.5, 2.5)));
+        assert!(lit(&wall, Vec2::new(1.5, 2.5), Vec2::new(7.5, 2.5)));
         // Running alongside it is clear too.
-        assert!(visible(&wall, Vec2::new(3.5, -3.0), Vec2::new(3.5, 5.0)));
+        assert!(lit(&wall, Vec2::new(3.5, -3.0), Vec2::new(3.5, 5.0)));
 
         let wall = TestPlan { south: vec![(0, 3)], ..Default::default() };
-        assert!(!visible(&wall, Vec2::new(0.5, 0.5), Vec2::new(0.5, 5.5)));
-        assert!(visible(&wall, Vec2::new(1.5, 0.5), Vec2::new(1.5, 5.5)));
+        assert!(!lit(&wall, Vec2::new(0.5, 0.5), Vec2::new(0.5, 5.5)));
+        assert!(lit(&wall, Vec2::new(1.5, 0.5), Vec2::new(1.5, 5.5)));
     }
 
     #[test]
     fn pillars_block() {
-        let plan = TestPlan { pillars: vec![(4, 4)], west: vec![(4, 4), (5, 4)], south: vec![(4, 4), (4, 5)] };
-        assert!(!visible(&plan, Vec2::new(1.5, 4.5), Vec2::new(8.5, 4.5)));
-        assert!(!visible(&plan, Vec2::new(4.5, 1.5), Vec2::new(4.5, 8.5)));
-        assert!(visible(&plan, Vec2::new(1.5, 5.5), Vec2::new(8.5, 5.5)));
+        let plan = TestPlan {
+            pillars: vec![(4, 4)],
+            west: vec![(4, 4), (5, 4)],
+            south: vec![(4, 4), (4, 5)],
+            ..Default::default()
+        };
+        assert!(!lit(&plan, Vec2::new(1.5, 4.5), Vec2::new(8.5, 4.5)));
+        assert!(!lit(&plan, Vec2::new(4.5, 1.5), Vec2::new(4.5, 8.5)));
+        assert!(lit(&plan, Vec2::new(1.5, 5.5), Vec2::new(8.5, 5.5)));
     }
 
     #[test]

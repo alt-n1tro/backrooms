@@ -30,7 +30,45 @@ pub enum Edge {
     #[default]
     Open = 0,
     Wall = 1,
+    /// A wall with an unglazed opening at chest height: you can see and
+    /// hear through it, but not walk through.
+    Window = 2,
+    /// A wall with a low hole at floor level, passable only on hands and
+    /// knees.
+    Crawl = 3,
 }
+
+impl Edge {
+    /// Height of the gap a body can pass through, in millimetres from the
+    /// floor, given the ceiling height. Zero means no way through.
+    pub const fn clearance_mm(self, ceiling_mm: u16) -> u16 {
+        match self {
+            Self::Open => ceiling_mm,
+            Self::Wall | Self::Window => 0,
+            Self::Crawl => CRAWL_HEIGHT_MM,
+        }
+    }
+}
+
+/// Height of a crawl hole.
+pub const CRAWL_HEIGHT_MM: u16 = 700;
+/// A window's opening runs from its sill to its head.
+pub const WINDOW_SILL_MM: u16 = 900;
+pub const WINDOW_HEAD_MM: u16 = 2000;
+
+/// How far a point of the 2 m wall lattice is pushed out of true, in
+/// centimetres. Almost always zero; where it is not, the walls meeting at
+/// that point are no longer square to each other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Skew {
+    /// East is positive.
+    pub dx: i8,
+    /// North is positive.
+    pub dy: i8,
+}
+
+/// Lattice points along one side of a chunk, counting both ends.
+pub const LATTICE: usize = N / 4 + 1;
 
 /// One floor tile.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -81,6 +119,10 @@ pub struct Chunk {
     /// `south[y][x]` is the edge on the south side of cell `(x, y)`. Row
     /// `y == 16` is the chunk's north boundary.
     pub south: [[Edge; N]; N + 1],
+    /// `skew[j][i]` belongs to the lattice point at cell corner
+    /// `(4 * i, 4 * j)`. Index 4 is the chunk's far boundary, shared with
+    /// the neighbouring chunk's index 0.
+    pub skew: [[Skew; LATTICE]; LATTICE],
     // A fixed array plus a length is a heap-free stand-in for `Vec`. The two
     // fields are private so the length can never disagree with the contents.
     fixtures: [Fixture; MAX_FIXTURES],
@@ -97,6 +139,7 @@ impl Chunk {
             cells: [[Cell::default(); N]; N],
             west: [[Edge::Open; N + 1]; N],
             south: [[Edge::Open; N]; N + 1],
+            skew: [[Skew::default(); LATTICE]; LATTICE],
             fixtures: [Fixture::default(); MAX_FIXTURES],
             fixture_count: 0,
         }
@@ -156,6 +199,11 @@ impl Chunk {
         for &edge in self.south.as_flattened() {
             key = key.with(edge as u64);
         }
+        for skew in self.skew.as_flattened() {
+            // `as u8` keeps the bit pattern of a negative number, so each
+            // value fills exactly one byte of the word.
+            key = key.with(skew.dx as u8 as u64 | (skew.dy as u8 as u64) << 8);
+        }
         key = key.with(self.fixture_count as u64);
         for f in self.fixtures() {
             key = key.with(f.x as u64 | (f.y as u64) << 8 | (f.state as u64) << 16).with(f.seed as u64);
@@ -194,7 +242,8 @@ mod tests {
     #[test]
     fn digest_sees_every_kind_of_field() {
         let base = empty();
-        let mut variants = [base.clone(), base.clone(), base.clone(), base.clone(), base.clone()];
+        let mut variants = [base.clone(), base.clone(), base.clone(), base.clone(), base.clone(), base.clone()];
+        variants[5].skew[4][4].dy = -1;
         variants[0].cells[15][15].wear = 1;
         variants[1].west[15][16] = Edge::Wall;
         variants[2].south[16][15] = Edge::Wall;
@@ -206,6 +255,14 @@ mod tests {
                 assert_ne!(a.digest(), b.digest());
             }
         }
+    }
+
+    #[test]
+    fn only_some_edges_can_be_passed() {
+        assert_eq!(Edge::Open.clearance_mm(2600), 2600);
+        assert_eq!(Edge::Wall.clearance_mm(2600), 0);
+        assert_eq!(Edge::Window.clearance_mm(2600), 0);
+        assert_eq!(Edge::Crawl.clearance_mm(2600), CRAWL_HEIGHT_MM);
     }
 
     #[test]

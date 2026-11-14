@@ -1,5 +1,5 @@
-//! The player: a camera at eye height that walks, sprints and jumps on the
-//! floor plan.
+//! The player: a camera at eye height that walks, sprints, jumps, crouches
+//! and crawls on the floor plan.
 
 use std::f32::consts::FRAC_PI_2;
 
@@ -13,12 +13,11 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 
-use crate::collide::slide;
+use crate::collide::{Body, slide};
 use crate::screen::Screen;
-use crate::space::{ChunkCache, LocalPlan, RenderOrigin, plan_to_world, world_to_plan};
-use crate::world::{Anchored, ViewDistance};
+use crate::space::{CELL, ChunkCache, LocalPlan, Plan, RenderOrigin, plan_to_world, world_to_plan};
+use crate::world::{Anchored, Ceiling, ViewDistance};
 
-const EYE_HEIGHT: f32 = 1.62;
 const RADIUS: f32 = 0.22;
 const WALK_SPEED: f32 = 1.7;
 const SPRINT_SPEED: f32 = 5.2;
@@ -40,6 +39,61 @@ const SPRINT_FOV: f32 = 6.0;
 /// The haze that distance fades into: the yellow of far-off lit wallpaper.
 const HAZE: Color = Color::srgb(0.20, 0.16, 0.05);
 
+/// How the player is holding themselves.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
+pub enum Posture {
+    /// On hands and knees: slow, but fits through a crawl hole.
+    Crawling,
+    Crouching,
+    #[default]
+    Standing,
+}
+
+impl Posture {
+    /// Height of the body, floor to top of head, in metres.
+    pub const fn body_height(self) -> f32 {
+        match self {
+            Self::Standing => 1.75,
+            Self::Crouching => 1.1,
+            Self::Crawling => 0.6,
+        }
+    }
+
+    /// Height of the eyes above the floor, in metres.
+    pub const fn eye_height(self) -> f32 {
+        match self {
+            Self::Standing => 1.62,
+            Self::Crouching => 0.98,
+            Self::Crawling => 0.42,
+        }
+    }
+
+    /// Unhurried speed in this posture, in metres per second.
+    pub const fn speed(self) -> f32 {
+        match self {
+            Self::Standing => WALK_SPEED,
+            Self::Crouching => 1.0,
+            Self::Crawling => 0.6,
+        }
+    }
+}
+
+/// The posture the keys ask for this frame, given the one asked for before.
+///
+/// C toggles crouching, X toggles crawling, and Space gets you back on your
+/// feet. Kept as a plain function so the rules can be tested.
+fn wanted_posture(wanted: Posture, crouch: bool, crawl: bool, rise: bool) -> Posture {
+    if rise {
+        Posture::Standing
+    } else if crawl {
+        if wanted == Posture::Crawling { Posture::Standing } else { Posture::Crawling }
+    } else if crouch {
+        if wanted == Posture::Crouching { Posture::Standing } else { Posture::Crouching }
+    } else {
+        wanted
+    }
+}
+
 #[derive(Component, Default)]
 pub struct Player {
     /// Current speed over the floor, in plan metres per second.
@@ -54,6 +108,12 @@ pub struct Player {
     last_tap: f32,
     /// How far into a sprint the camera is, 0 to 1, for the field of view.
     rush: f32,
+    /// How the body is held now, and what the player has asked for. They
+    /// differ while there is no room to get up.
+    posture: Posture,
+    wanted: Posture,
+    /// Where the eyes are now, easing towards the posture's eye height.
+    eye: f32,
 }
 
 /// Where the player starts and which way they face.
@@ -90,7 +150,7 @@ fn setup(mut commands: Commands, spawn: Res<Spawn>, view: Res<ViewDistance>, scr
     let reach = view.metres();
     commands.spawn((
         // No press of W has happened yet, so none can be half of a double-tap.
-        Player { last_tap: f32::NEG_INFINITY, ..default() },
+        Player { last_tap: f32::NEG_INFINITY, eye: Posture::Standing.eye_height(), ..default() },
         Anchored,
         Camera3d::default(),
         // The view is drawn into an off-screen picture, which `screen` then
@@ -101,12 +161,8 @@ fn setup(mut commands: Commands, spawn: Res<Spawn>, view: Res<ViewDistance>, scr
         // In Bevy's YXZ order the first angle is yaw about the up axis and
         // the second is pitch. With no rotation the camera looks along -Z,
         // which is north.
-        Transform::from_translation(plan_to_world(spawn.plan, EYE_HEIGHT)).with_rotation(Quat::from_euler(
-            EulerRot::YXZ,
-            spawn.yaw.to_radians(),
-            spawn.pitch.to_radians(),
-            0.0,
-        )),
+        Transform::from_translation(plan_to_world(spawn.plan, Posture::Standing.eye_height()))
+            .with_rotation(Quat::from_euler(EulerRot::YXZ, spawn.yaw.to_radians(), spawn.pitch.to_radians(), 0.0)),
         // Exposure for a dim interior. Without it, physically sized lights
         // would look like a cave: the default suits a much brighter room.
         Exposure { ev100: 6.4 },
@@ -180,6 +236,7 @@ pub fn walk(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     origin: Res<RenderOrigin>,
+    ceiling: Res<Ceiling>,
     cache: Res<ChunkCache>,
     mut surroundings: ResMut<Surroundings>,
     player: Single<(&mut Transform, &mut Player, &mut Projection)>,
@@ -211,16 +268,22 @@ pub fn walk(
     if !keys.pressed(KeyCode::KeyW) {
         player.sprinting = false;
     }
-    let sprint = player.sprinting || keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let target = wish.normalize_or_zero() * if sprint { SPRINT_SPEED } else { WALK_SPEED };
+    // Only someone on their feet can sprint.
+    let sprint = player.posture == Posture::Standing
+        && (player.sprinting || keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]));
+    let target = wish.normalize_or_zero() * if sprint { SPRINT_SPEED } else { player.posture.speed() };
 
     // Ease towards the wanted velocity. The exponential makes the easing
     // behave the same at any frame rate.
     let blend = 1.0 - (-RESPONSE * dt).exp();
     player.velocity = player.velocity.lerp(target, blend);
 
-    // Jump, then let gravity do the rest.
-    if keys.just_pressed(KeyCode::Space) && player.height == 0.0 {
+    // Space jumps when standing; when down low it means "get up" instead.
+    let space = keys.just_pressed(KeyCode::Space);
+    let low = player.posture != Posture::Standing;
+    player.wanted =
+        wanted_posture(player.wanted, keys.just_pressed(KeyCode::KeyC), keys.just_pressed(KeyCode::KeyX), space && low);
+    if space && !low && player.height == 0.0 {
         player.rising = JUMP_SPEED;
     }
     if player.height > 0.0 || player.rising > 0.0 {
@@ -237,12 +300,35 @@ pub fn walk(
     let plan = surroundings.0.as_ref().expect("set just above");
     // The snapshot measures from its own corner, not from the render origin.
     let corner = origin.plan_of(plan.base);
-    let to = slide(plan, from - corner, player.velocity * dt, RADIUS) + corner;
+    // Where the lattice is out of true, what is drawn has been pushed off
+    // the plan. Collision is done on the undistorted plan, so the player's
+    // real position is pulled back onto it first and pushed out again after.
+    // Almost everywhere both steps change nothing.
+    let on_plan = plan.unwarp((from - corner) / CELL) * CELL;
+    let body = |posture: Posture| Body { radius: RADIUS, height: posture.body_height(), ceiling: ceiling.0 };
+
+    // Change posture. Getting lower always works; getting up needs room,
+    // and until there is room the request simply waits.
+    if player.wanted != player.posture && player.height == 0.0 {
+        let fits = |posture: Posture| slide(plan, on_plan, Vec2::ZERO, body(posture)).distance(on_plan) < 1e-3;
+        if player.wanted < player.posture || fits(player.wanted) {
+            player.posture = player.wanted;
+        } else if player.posture == Posture::Crawling && fits(Posture::Crouching) {
+            // No room to stand, but enough to get off the floor.
+            player.posture = Posture::Crouching;
+        }
+    }
+
+    let moved = slide(plan, on_plan, player.velocity * dt, body(player.posture));
+    let to = moved + plan.warp(moved / CELL) + corner;
     // What actually happened is the velocity: walking into a wall stops you.
     if dt > 0.0 {
         player.velocity = (to - from) / dt;
     }
-    transform.translation = plan_to_world(to, EYE_HEIGHT + player.height);
+    // The eyes glide to their new height rather than snapping.
+    let eye = player.posture.eye_height();
+    player.eye += (eye - player.eye) * (1.0 - (-10.0 * dt).exp());
+    transform.translation = plan_to_world(to, player.eye + player.height);
 
     // Widen the view a little while actually moving fast.
     let fast = sprint && player.velocity.length() > WALK_SPEED * 1.5;
@@ -288,7 +374,35 @@ mod tests {
         assert!((0.5..0.7).contains(&seconds), "airborne for {seconds} s");
         assert_eq!(rising, 0.0);
         // The head (eyes plus a little) stays under a 2.6 m ceiling.
-        assert!(EYE_HEIGHT + 0.15 + peak < 2.6);
+        assert!(Posture::Standing.body_height() + peak < 2.6);
+    }
+
+    #[test]
+    fn posture_keys_toggle_and_space_gets_you_up() {
+        use Posture::*;
+        // C and X each toggle their own posture.
+        assert_eq!(wanted_posture(Standing, true, false, false), Crouching);
+        assert_eq!(wanted_posture(Crouching, true, false, false), Standing);
+        assert_eq!(wanted_posture(Standing, false, true, false), Crawling);
+        assert_eq!(wanted_posture(Crawling, false, true, false), Standing);
+        // Straight from one low posture to the other.
+        assert_eq!(wanted_posture(Crouching, false, true, false), Crawling);
+        assert_eq!(wanted_posture(Crawling, true, false, false), Crouching);
+        // Space always means "up"; no key means no change.
+        assert_eq!(wanted_posture(Crawling, false, false, true), Standing);
+        assert_eq!(wanted_posture(Crouching, false, false, false), Crouching);
+    }
+
+    #[test]
+    fn postures_are_ordered_and_only_crawling_fits_a_crawl_hole() {
+        use backrooms_core::chunk::CRAWL_HEIGHT_MM;
+        assert!(Posture::Crawling < Posture::Crouching && Posture::Crouching < Posture::Standing);
+        let hole = CRAWL_HEIGHT_MM as f32 / 1000.0;
+        assert!(Posture::Crawling.body_height() <= hole);
+        assert!(Posture::Crouching.body_height() > hole);
+        for posture in [Posture::Crawling, Posture::Crouching, Posture::Standing] {
+            assert!(posture.eye_height() < posture.body_height());
+        }
     }
 
     #[test]

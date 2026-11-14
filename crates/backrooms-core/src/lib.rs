@@ -29,12 +29,14 @@ pub mod generator;
 pub mod hash;
 pub mod level;
 pub mod noise;
+pub mod rarity;
 pub mod zstack;
 
-pub use chunk::{Cell, Chunk, Dir, Edge, Fixture, LightState};
+pub use chunk::{Cell, Chunk, Dir, Edge, Fixture, LightState, Skew};
 pub use coord::{Address, AddressError, CellPos, ChunkPos, RegionPos};
 pub use generator::{GenError, generate_chunk, level_info};
 pub use level::{LEVEL_COUNT, LevelGroup, LevelId, LevelInfo};
+pub use rarity::Rarity;
 
 /// Which generator produced (or should produce) a piece of world.
 ///

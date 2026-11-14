@@ -127,6 +127,75 @@ fn walls_stay_on_the_lattice() {
     });
 }
 
+/// Windows and crawl holes only ever sit in the middle metre of a complete
+/// 2 m piece of wall, with half a metre of plain wall on each side.
+#[test]
+fn features_sit_in_the_middle_of_whole_wall_pieces() {
+    let check = |edges: [Edge; 4], what: &str| {
+        let special = |e: Edge| e == Edge::Window || e == Edge::Crawl;
+        if edges.iter().any(|&e| special(e)) {
+            assert!(
+                edges[0] == Edge::Wall && edges[3] == Edge::Wall && special(edges[1]) && edges[1] == edges[2],
+                "misplaced feature in {what}: {edges:?}"
+            );
+        }
+    };
+    let (mut windows, mut crawls) = (0, 0);
+    for_each_sample(|pos| {
+        let c = chunk(pos);
+        // Lines 0, 4, 8 and 12: line 16 is the next chunk's line 0.
+        for line in (0..N).step_by(4) {
+            for start in (0..N).step_by(4) {
+                let ns: [Edge; 4] = std::array::from_fn(|b| c.west[start + b][line]);
+                let ew: [Edge; 4] = std::array::from_fn(|b| c.south[line][start + b]);
+                check(ns, &format!("{pos:?} north-south line {line} from {start}"));
+                check(ew, &format!("{pos:?} east-west line {line} from {start}"));
+                for piece in [ns, ew] {
+                    windows += (piece[1] == Edge::Window) as u32;
+                    crawls += (piece[1] == Edge::Crawl) as u32;
+                }
+            }
+        }
+        // Off the lattice lines there is never a feature.
+        for y in 0..N {
+            for x in 0..N {
+                if x % 4 != 0 {
+                    assert!(matches!(c.west[y][x], Edge::Open | Edge::Wall));
+                }
+                if y % 4 != 0 {
+                    assert!(matches!(c.south[y][x], Edge::Open | Edge::Wall));
+                }
+            }
+        }
+    });
+    // Windows are common, crawl holes about eight times rarer.
+    assert!(windows > 300, "{windows} windows");
+    assert!(crawls > 30 && crawls * 3 < windows, "{crawls} crawl holes against {windows} windows");
+}
+
+/// Lattice points on a chunk boundary belong to both chunks, which must
+/// agree on how far each is out of true. Most of the world is square.
+#[test]
+fn skew_is_shared_bounded_and_mostly_absent() {
+    let (mut points, mut skewed) = (0, 0);
+    for_each_sample(|pos| {
+        let here = chunk(pos);
+        let east = chunk(pos.offset(1, 0));
+        let north = chunk(pos.offset(0, 1));
+        for i in 0..5 {
+            assert_eq!(here.skew[i][4], east.skew[i][0], "east seam of {pos:?}");
+            assert_eq!(here.skew[4][i], north.skew[0][i], "north seam of {pos:?}");
+        }
+        for skew in here.skew.as_flattened() {
+            assert!(skew.dx.abs() <= 28 && skew.dy.abs() <= 28, "{skew:?} in {pos:?}");
+            points += 1;
+            skewed += (skew.dx != 0 || skew.dy != 0) as u32;
+        }
+    });
+    assert!(skewed > 100, "only {skewed} skewed lattice points");
+    assert!(skewed * 4 < points, "{skewed} of {points} lattice points are skewed");
+}
+
 /// Flood-fills a `side` x `side` block of chunks and returns
 /// `(cells in the largest connected area, walkable cells)`.
 fn largest_area(south_west: ChunkPos, side: usize) -> (usize, usize) {

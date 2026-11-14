@@ -8,8 +8,8 @@ use std::process::ExitCode;
 
 use backrooms_core::generator::v1::golden;
 use backrooms_core::{
-    Address, CellPos, Chunk, ChunkPos, GenError, GeneratorVersion, LEVEL_COUNT, LevelId, generate_chunk, level_info,
-    zstack,
+    Address, CellPos, Chunk, ChunkPos, Edge, GenError, GeneratorVersion, LEVEL_COUNT, LevelId, generate_chunk,
+    level_info, zstack,
 };
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
@@ -54,8 +54,107 @@ enum Command {
     },
     /// List the vertical order of the 128 levels.
     Stack,
+    /// Find the nearest oddities to a location, with where to stand to see
+    /// each one.
+    Find {
+        /// What to look for.
+        #[arg(value_enum)]
+        what: Oddity,
+        #[command(flatten)]
+        at: Location,
+        /// How many to list.
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u32).range(1..=100))]
+        count: u32,
+        /// How far to search, in chunks of 8 m.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(i32).range(1..=512))]
+        radius: i32,
+    },
     /// Print the golden-hash table for the current generator.
     Golden,
+}
+
+/// Something out of the ordinary to search for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum Oddity {
+    /// An unglazed opening in a wall.
+    Window,
+    /// A low hole through a wall.
+    Crawl,
+    /// A place where the walls are well out of true.
+    Skew,
+}
+
+/// A place to stand and a direction to face (degrees anticlockwise from
+/// north, as the game's --yaw takes it) to see an oddity.
+struct Sighting {
+    stand: CellPos,
+    yaw: i32,
+}
+
+/// The oddities in one chunk.
+fn sightings(chunk: &Chunk, what: Oddity, found: &mut Vec<Sighting>) {
+    let origin = chunk.pos.origin();
+    let wanted = match what {
+        Oddity::Window => Edge::Window,
+        Oddity::Crawl => Edge::Crawl,
+        Oddity::Skew => {
+            // Only lattice points pushed at least 15 cm: less is hard to see.
+            for (j, row) in chunk.skew.iter().enumerate().take(4) {
+                for (i, skew) in row.iter().enumerate().take(4) {
+                    if skew.dx.unsigned_abs().max(skew.dy.unsigned_abs()) >= 15 {
+                        found.push(Sighting { stand: origin.offset(i as i32 * 4 + 1, j as i32 * 4 + 1), yaw: 0 });
+                    }
+                }
+            }
+            return;
+        }
+    };
+    // A feature fills the two middle cells of a wall piece; reporting the
+    // first of the pair lists each feature once. Index 16 belongs to the
+    // next chunk.
+    for y in 0..16usize {
+        for x in 0..16usize {
+            let here = origin.offset(x as i32, y as i32);
+            if y % 4 == 1 && chunk.west[y][x] == wanted {
+                // The wall runs north; stand a metre west of it, facing east.
+                found.push(Sighting { stand: here.offset(-2, 0), yaw: -90 });
+            }
+            if x % 4 == 1 && chunk.south[y][x] == wanted {
+                // The wall runs east; stand a metre south of it, facing north.
+                found.push(Sighting { stand: here.offset(0, -2), yaw: 0 });
+            }
+        }
+    }
+}
+
+/// Searches outwards from `address` in square rings of chunks until enough
+/// has been found, and returns the nearest `count`.
+fn find(address: Address, what: Oddity, count: usize, radius: i32) -> Result<Vec<Sighting>, String> {
+    let centre = address.cell.chunk();
+    let mut found = Vec::new();
+    for ring in 0..=radius {
+        for dy in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dy.abs()) == ring {
+                    let chunk = generate_chunk(address.version, address.level, centre.offset(dx, dy))
+                        .map_err(|e| e.to_string())?;
+                    sightings(&chunk, what, &mut found);
+                }
+            }
+        }
+        // One more ring past the first hits, since a square ring's corners
+        // are further away than the next ring's sides.
+        if found.len() >= count * 2 {
+            break;
+        }
+    }
+    let distance = |s: &Sighting| {
+        let (dx, dy) = address.cell.delta_to(s.stand);
+        (dx as i64).pow(2) + (dy as i64).pow(2)
+    };
+    found.sort_by_key(distance);
+    found.truncate(count);
+    Ok(found)
 }
 
 /// Where to look. Either a full address, or level and coordinates.
@@ -142,6 +241,24 @@ fn run(cli: Cli) -> Result<(), String> {
                 let info = level_info(version, level);
                 let status = if info.built { format!("LEVEL {}", info.name) } else { "reserved".into() };
                 let _ = writeln!(out, "{depth:>5}  {:>5}  {:<7}  {status}", level.get(), info.group.name());
+            }
+        }
+        Command::Find { what, at, count, radius } => {
+            let address = at.resolve()?;
+            let found = find(address, what, count as usize, radius)?;
+            if found.is_empty() {
+                let _ = writeln!(out, "Nothing within {radius} chunks of {address}. Try a larger --radius.");
+            }
+            for sighting in found {
+                let (dx, dy) = address.cell.delta_to(sighting.stand);
+                // Half a metre per cell.
+                let metres = ((dx as f64).hypot(dy as f64) / 2.0).round();
+                let _ = writeln!(
+                    out,
+                    "{metres:>5} m away: --address {} --yaw {}",
+                    Address { cell: sighting.stand, ..address },
+                    sighting.yaw
+                );
             }
         }
         Command::Golden => {

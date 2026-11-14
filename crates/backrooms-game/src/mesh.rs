@@ -1,14 +1,22 @@
 //! Turns one chunk of floor plan into triangles.
 //!
-//! The output is a single mesh per chunk: floor, ceiling, wall slabs and
-//! pillars. Positions are in metres relative to the chunk's south-west
-//! corner, so the same mesh is valid wherever the render origin is.
+//! The output is a single mesh per chunk: floor, ceiling, wall slabs (with
+//! their windows and crawl holes cut out) and pillars. Positions are in
+//! metres relative to the chunk's south-west corner, so the same mesh is
+//! valid wherever the render origin is.
 //!
-//! Each vertex carries three numbers in its colour: red is moisture and
-//! green is wear (both from the core), and blue is the baked light falling
-//! on it (from [`crate::bake`]). The surface shader turns those into what
-//! you see; nothing here decides what anything looks like.
+//! Each vertex carries four numbers in its colour: red is moisture and
+//! green is wear (both from the core), blue is the baked light falling on it
+//! (from [`crate::bake`]), and alpha marks plain trim such as the inside of
+//! a window opening. The surface shader turns those into what you see;
+//! nothing here decides what anything looks like.
+//!
+//! Everything is laid out on the undistorted plan first. Where the core says
+//! the lattice is out of true, each vertex is pushed by [`Plan::warp`] at
+//! the last moment, so skewed walls need no special handling anywhere else.
 
+use backrooms_core::Edge;
+use backrooms_core::chunk::{CRAWL_HEIGHT_MM, WINDOW_HEAD_MM, WINDOW_SILL_MM};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -22,6 +30,10 @@ const N: i32 = backrooms_core::coord::CHUNK_SIZE;
 /// between 0 and 1. The shader multiplies by the same number.
 pub const LUX_PER_UNIT: f32 = 1000.0;
 
+const CRAWL_HEIGHT: f32 = CRAWL_HEIGHT_MM as f32 / 1000.0;
+const WINDOW_SILL: f32 = WINDOW_SILL_MM as f32 / 1000.0;
+const WINDOW_HEAD: f32 = WINDOW_HEAD_MM as f32 / 1000.0;
+
 /// Raw triangle data, kept separate from Bevy's `Mesh` so it can be built on
 /// a worker thread and tested without a renderer.
 #[derive(Default, Debug)]
@@ -32,8 +44,18 @@ pub struct Geometry {
     pub indices: Vec<u32>,
 }
 
-/// A corner of a quad: where it is on the plan, how high, and what the
-/// surface is like there.
+impl Geometry {
+    pub fn into_mesh(self) -> Mesh {
+        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+            .with_inserted_indices(Indices::U32(self.indices))
+    }
+}
+
+/// A corner of a quad: where it is on the undistorted plan (in metres), how
+/// high, and what the surface is like there.
 #[derive(Clone, Copy)]
 struct Corner {
     plan: Vec2,
@@ -44,60 +66,101 @@ struct Corner {
     lux: f32,
 }
 
-impl Geometry {
+/// A range of heights, bottom and top, in metres.
+type Span = (f32, f32);
+
+/// The parts of a wall piece that are solid, as height ranges in metres, and
+/// the opening between them if there is one.
+fn profile(edge: Edge, ceiling: f32) -> (Vec<Span>, Option<Span>) {
+    match edge {
+        Edge::Open => (vec![], None),
+        Edge::Wall => (vec![(0.0, ceiling)], None),
+        Edge::Window => (vec![(0.0, WINDOW_SILL), (WINDOW_HEAD, ceiling)], Some((WINDOW_SILL, WINDOW_HEAD))),
+        Edge::Crawl => (vec![(CRAWL_HEIGHT, ceiling)], Some((0.0, CRAWL_HEIGHT))),
+    }
+}
+
+/// Collects triangles for one chunk.
+///
+/// The lifetime `'a` says the builder borrows the plan and may not outlive
+/// it; `P: Plan` lets the same code run on a real chunk or a test plan, with
+/// no cost at run time (the compiler makes a copy of the code for each).
+struct Builder<'a, P: Plan> {
+    out: Geometry,
+    plan: &'a P,
+    heights: [f32; ROWS],
+    ceiling: f32,
+}
+
+impl<P: Plan> Builder<'_, P> {
     /// Adds a four-sided face. `corners` go around the face in either
     /// direction; the winding is fixed up here so that the face is visible
-    /// from the side `normal` points to. (Triangles are only drawn when their
-    /// corners appear anticlockwise on screen, so getting this wrong makes a
-    /// face invisible. Checking it in one place beats reasoning about it for
-    /// every wall direction.)
-    fn quad(&mut self, corners: [Corner; 4], normal: Vec3) {
-        let world = corners.map(|c| plan_to_world(c.plan, c.height));
-        let facing = (world[1] - world[0]).cross(world[2] - world[0]).dot(normal);
-        let order: [usize; 4] = if facing >= 0.0 { [0, 1, 2, 3] } else { [3, 2, 1, 0] };
+    /// from the side `facing` points to. (Triangles are only drawn when
+    /// their corners appear anticlockwise on screen, so getting this wrong
+    /// makes a face invisible. Checking it in one place beats reasoning
+    /// about it for every wall direction.)
+    ///
+    /// `trim` marks plain surfaces such as the inside of an opening, which
+    /// the shader paints as woodwork rather than as wallpaper or carpet.
+    fn quad(&mut self, corners: [Corner; 4], facing: Vec3, trim: bool) {
+        // Out-of-true lattice points drag their surroundings with them.
+        let world = corners.map(|c| plan_to_world(c.plan + self.plan.warp(c.plan / CELL), c.height));
+        let face = (world[1] - world[0]).cross(world[2] - world[0]);
+        let same_way = face.dot(facing) >= 0.0;
+        let order: [usize; 4] = if same_way { [0, 1, 2, 3] } else { [3, 2, 1, 0] };
+        // On a skewed wall the true normal differs slightly from the one
+        // asked for, so it is taken from the face itself.
+        let normal = (if same_way { face } else { -face }).try_normalize().unwrap_or(facing);
 
-        let first = self.positions.len() as u32;
+        let first = self.out.positions.len() as u32;
         for i in order {
-            self.positions.push(world[i].to_array());
-            self.normals.push(normal.to_array());
             let c = corners[i];
-            self.colors.push([c.condition.x, c.condition.y, c.lux / LUX_PER_UNIT, 1.0]);
+            self.out.positions.push(world[i].to_array());
+            self.out.normals.push(normal.to_array());
+            self.out.colors.push([c.condition.x, c.condition.y, c.lux / LUX_PER_UNIT, if trim { 0.0 } else { 1.0 }]);
         }
-        self.indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
+        self.out.indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
     }
 
-    /// An upright face from plan point `a` to plan point `b`, floor to
-    /// ceiling, as a stack of quads with a row of vertices at each height
+    /// Light at `height`, given the light at each of the baker's heights.
+    fn lux_at(&self, rows: &[f32; ROWS], height: f32) -> f32 {
+        let step = self.ceiling / (ROWS - 1) as f32;
+        let position = (height / step).clamp(0.0, (ROWS - 1) as f32);
+        let below = (position.floor() as usize).min(ROWS - 2);
+        rows[below] + (rows[below + 1] - rows[below]) * (position - below as f32)
+    }
+
+    /// An upright face from plan point `a` to plan point `b`, between two
+    /// heights, as a stack of quads with a row of vertices at each height
     /// the baker reports light for. One tall quad could only blend from its
     /// bottom to its top, and would miss the bright band a panel throws high
     /// on a nearby wall.
     #[allow(clippy::too_many_arguments)]
     fn upright(
         &mut self,
-        heights: &[f32; ROWS],
         a: Vec2,
         b: Vec2,
-        normal: Vec2,
+        facing: Vec2,
         condition: [Vec2; 2],
         lux: [[f32; ROWS]; 2],
+        (low, high): (f32, f32),
+        trim: bool,
     ) {
-        for row in 0..ROWS - 1 {
-            let at = |end: usize, row: usize| Corner {
-                plan: [a, b][end],
-                height: heights[row],
-                condition: condition[end],
-                lux: lux[end][row],
-            };
-            self.quad([at(0, row), at(1, row), at(1, row + 1), at(0, row + 1)], plan_to_world(normal, 0.0));
-        }
-    }
+        // The bottom, any baker height strictly inside the range, the top.
+        let mut levels = vec![low];
+        levels.extend(self.heights.iter().copied().filter(|&h| h > low + 1e-3 && h < high - 1e-3));
+        levels.push(high);
 
-    pub fn into_mesh(self) -> Mesh {
-        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
-            .with_inserted_indices(Indices::U32(self.indices))
+        for pair in levels.windows(2) {
+            let at = |end: usize, height: f32| Corner {
+                plan: [a, b][end],
+                height,
+                condition: condition[end],
+                lux: self.lux_at(&lux[end], height),
+            };
+            let corners = [at(0, pair[0]), at(1, pair[0]), at(1, pair[1]), at(0, pair[1])];
+            self.quad(corners, plan_to_world(facing, 0.0), trim);
+        }
     }
 }
 
@@ -135,10 +198,10 @@ fn corner_light<P: Plan>(plan: &P, baker: &Baker<P>) -> Vec<[f32; 4]> {
             // Which neighbouring quadrants are joined (no wall between).
             // The raw core edges are used, so pillar sides count as walls.
             let joined = [
-                (0, 1, !plan.edge_west(x, y - 1)),
-                (2, 3, !plan.edge_west(x, y)),
-                (0, 2, !plan.edge_south(x - 1, y)),
-                (1, 3, !plan.edge_south(x, y)),
+                (0, 1, plan.west(x, y - 1) == Edge::Open),
+                (2, 3, plan.west(x, y) == Edge::Open),
+                (0, 2, plan.south(x - 1, y) == Edge::Open),
+                (1, 3, plan.south(x, y) == Edge::Open),
             ];
             // Give every quadrant a group number, then merge joined groups.
             // With four items, repeating the merge three times is enough for
@@ -165,13 +228,144 @@ fn corner_light<P: Plan>(plan: &P, baker: &Baker<P>) -> Vec<[f32; 4]> {
     out
 }
 
+/// Which way a wall slab runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// On the west side of its cell, running north.
+    North,
+    /// On the south side of its cell, running east.
+    East,
+}
+
+/// Builds the wall piece on the west (`Run::North`) or south (`Run::East`)
+/// side of cell `(x, y)`.
+///
+/// The two directions are the same shape turned a quarter turn, so the code
+/// is written once in terms of "along" the wall and "across" it, and `at`
+/// turns that back into east and north.
+fn slab<P: Plan>(b: &mut Builder<P>, baker: &Baker<P>, run: Run, x: i32, y: i32, condition: [Vec2; 2]) {
+    let plan = b.plan;
+    // The piece `step` places further along the wall.
+    let kind = |step: i32| match run {
+        Run::North => plan.slab_ns(x, y + step),
+        Run::East => plan.slab_ew(x + step, y),
+    };
+    let here = kind(0);
+    if here == Edge::Open {
+        return;
+    }
+    // Whether another wall meets this one at the given end (0 or 1), on the
+    // given side (-1 or 0, as a cell offset across the wall).
+    let meets = |side: i32, end: i32| match run {
+        Run::North => plan.slab_ew(x + side, y + end) != Edge::Open,
+        Run::East => plan.slab_ns(x + end, y + side) != Edge::Open,
+    };
+    let (start, line) = match run {
+        Run::North => (y as f32, x as f32),
+        Run::East => (x as f32, y as f32),
+    };
+    // A point given as cells along the wall and cells across it.
+    let at = |along: f32, across: f32| match run {
+        Run::North => Vec2::new(across, along),
+        Run::East => Vec2::new(along, across),
+    };
+    let (along_axis, across_axis) = (at(1.0, 0.0), at(0.0, 1.0));
+    let half = WALL_HALF / CELL;
+
+    // Where the wall does not continue, the slab is lengthened by half its
+    // thickness. At a corner that fills the little square both walls share;
+    // at a doorway it forms the jamb.
+    let ends = [kind(-1) == Edge::Open, kind(1) == Edge::Open];
+    let from = start - if ends[0] { half } else { 0.0 };
+    let to = start + 1.0 + if ends[1] { half } else { 0.0 };
+    let (solid, opening) = profile(here, b.ceiling);
+
+    // The two long faces. Light is sampled just off each face. Along an
+    // unbroken wall the sample sits exactly at the join between pieces, so
+    // neighbouring pieces agree. Where the wall ends, or another wall meets
+    // this face, it is pulled back along the wall so that it stays on this
+    // face's side of the corner.
+    let mut face_lux = [[[0.0; ROWS]; 2]; 2];
+    for (index, (side, sign)) in [(-1, -1.0), (0, 1.0)].into_iter().enumerate() {
+        let facing = across_axis * sign;
+        let off = line + sign * NUDGE;
+        let pull = |end: usize| if ends[end] || meets(side, end as i32) { NUDGE } else { 0.0 };
+        let lux = [baker.wall(at(start + pull(0), off), facing), baker.wall(at(start + 1.0 - pull(1), off), facing)];
+        face_lux[index] = lux;
+        let across = line + sign * half;
+        for &range in &solid {
+            b.upright(at(from, across) * CELL, at(to, across) * CELL, facing, condition, lux, range, false);
+        }
+    }
+
+    // End caps where the wall stops.
+    for (end, along, sign) in [(0, from, -1.0), (1, to, 1.0)] {
+        if ends[end] {
+            let facing = along_axis * sign;
+            let lux = baker.wall(at(along + sign * NUDGE, line), facing);
+            let c = [condition[end]; 2];
+            for &range in &solid {
+                b.upright(
+                    at(along, line - half) * CELL,
+                    at(along, line + half) * CELL,
+                    facing,
+                    c,
+                    [lux, lux],
+                    range,
+                    false,
+                );
+            }
+        }
+    }
+
+    // The inside of a window or crawl hole: a sill and a head across the
+    // wall's thickness, and a jamb wherever the opening stops.
+    let Some((low, high)) = opening else {
+        return;
+    };
+    // The lining sees roughly what the two faces see, so it takes their
+    // average.
+    let lining: [[f32; ROWS]; 2] =
+        std::array::from_fn(|end| std::array::from_fn(|row| (face_lux[0][end][row] + face_lux[1][end][row]) / 2.0));
+    for (height, facing) in [(low, Vec3::Y), (high, Vec3::NEG_Y)] {
+        // The floor is the bottom of a crawl hole, and nothing here reaches
+        // the ceiling.
+        if height <= 0.0 || height >= b.ceiling {
+            continue;
+        }
+        let corner = |end: usize, across: f32| Corner {
+            plan: at(start + end as f32, line + across) * CELL,
+            height,
+            condition: condition[end],
+            lux: b.lux_at(&lining[end], height),
+        };
+        b.quad([corner(0, -half), corner(1, -half), corner(1, half), corner(0, half)], facing, true);
+    }
+    for (end, step, sign) in [(0, -1, 1.0), (1, 1, -1.0)] {
+        if kind(step) != here {
+            let along = start + end as f32;
+            let c = [condition[end]; 2];
+            let lux = [lining[end]; 2];
+            // The jamb faces into the opening.
+            b.upright(
+                at(along, line - half) * CELL,
+                at(along, line + half) * CELL,
+                along_axis * sign,
+                c,
+                lux,
+                (low, high),
+                true,
+            );
+        }
+    }
+}
+
 /// Builds the geometry of the chunk whose south-west cell is the plan's
 /// `(0, 0)`. The plan must also cover the neighbouring chunks: walls
 /// continuing across the boundary and lights shining in from next door are
 /// looked up there.
 pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geometry {
-    let mut g = Geometry::default();
-    let heights = baker.heights();
+    let mut b = Builder { out: Geometry::default(), plan, heights: baker.heights(), ceiling };
 
     // Surface condition at a cell corner: the average of the four cells that
     // meet there. Sampling at corners (rather than colouring whole cells)
@@ -182,7 +376,6 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
             / 4.0
     };
     let m = |cells: i32| cells as f32 * CELL;
-    let cells = |x: f32, y: f32| Vec2::new(x, y);
 
     // Floor and ceiling, one quad per cell.
     let light = corner_light(plan, baker);
@@ -195,7 +388,7 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
             // The four corners of this cell, each with the light of the
             // quadrant that points back into the cell.
             let around = [(x, y, 3), (x + 1, y, 2), (x + 1, y + 1, 0), (x, y + 1, 1)];
-            for (height, normal, total) in [
+            for (height, facing, total) in [
                 (0.0, Vec3::Y, Baker::<P>::floor_total as fn(f32) -> f32),
                 (ceiling, Vec3::NEG_Y, Baker::<P>::ceiling_total as fn(f32) -> f32),
             ] {
@@ -205,102 +398,50 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
                     condition: at_corner(cx, cy),
                     lux: total(light_at(cx, cy, quadrant)),
                 });
-                g.quad(corners, normal);
+                b.quad(corners, facing, false);
             }
         }
     }
 
     for y in 0..N {
         for x in 0..N {
-            let (ca, cb_n, cb_e) = (at_corner(x, y), at_corner(x, y + 1), at_corner(x + 1, y));
-            let (fx, fy) = (x as f32, y as f32);
-
-            // Wall slab on the west side of the cell, running north.
-            if plan.wall_ns(x, y) {
-                let line = m(x);
-                // Where the wall does not continue, the slab is lengthened by
-                // half its thickness. At a corner that fills the little square
-                // both walls share; at a doorway it forms the jamb.
-                let ends_south = !plan.wall_ns(x, y - 1);
-                let ends_north = !plan.wall_ns(x, y + 1);
-                let south = m(y) - if ends_south { WALL_HALF } else { 0.0 };
-                let north = m(y + 1) + if ends_north { WALL_HALF } else { 0.0 };
-                let (w, e) = (line - WALL_HALF, line + WALL_HALF);
-
-                // Light is sampled just off each face. Along an unbroken
-                // wall the sample sits exactly at the join between pieces,
-                // so neighbouring pieces agree. Where the wall ends, or
-                // another wall meets this face, it is pulled back along the
-                // wall so that it stays on this face's side of the corner.
-                for (face, side, normal) in [(w, -1, Vec2::NEG_X), (e, 0, Vec2::X)] {
-                    let off = fx + if side < 0 { -NUDGE } else { NUDGE };
-                    let pull_south = if ends_south || plan.wall_ew(x + side, y) { NUDGE } else { 0.0 };
-                    let pull_north = if ends_north || plan.wall_ew(x + side, y + 1) { NUDGE } else { 0.0 };
-                    let lux = [
-                        baker.wall(cells(off, fy + pull_south), normal),
-                        baker.wall(cells(off, fy + 1.0 - pull_north), normal),
-                    ];
-                    g.upright(&heights, Vec2::new(face, south), Vec2::new(face, north), normal, [ca, cb_n], lux);
-                }
-                if ends_south {
-                    let lux = baker.wall(cells(fx, fy - NUDGE), Vec2::NEG_Y);
-                    g.upright(&heights, Vec2::new(w, south), Vec2::new(e, south), Vec2::NEG_Y, [ca, ca], [lux, lux]);
-                }
-                if ends_north {
-                    let lux = baker.wall(cells(fx, fy + 1.0 + NUDGE), Vec2::Y);
-                    g.upright(&heights, Vec2::new(w, north), Vec2::new(e, north), Vec2::Y, [cb_n, cb_n], [lux, lux]);
-                }
-            }
-
-            // Wall slab on the south side of the cell, running east.
-            if plan.wall_ew(x, y) {
-                let line = m(y);
-                let ends_west = !plan.wall_ew(x - 1, y);
-                let ends_east = !plan.wall_ew(x + 1, y);
-                let west = m(x) - if ends_west { WALL_HALF } else { 0.0 };
-                let east = m(x + 1) + if ends_east { WALL_HALF } else { 0.0 };
-                let (s, n) = (line - WALL_HALF, line + WALL_HALF);
-
-                for (face, side, normal) in [(s, -1, Vec2::NEG_Y), (n, 0, Vec2::Y)] {
-                    let off = fy + if side < 0 { -NUDGE } else { NUDGE };
-                    let pull_west = if ends_west || plan.wall_ns(x, y + side) { NUDGE } else { 0.0 };
-                    let pull_east = if ends_east || plan.wall_ns(x + 1, y + side) { NUDGE } else { 0.0 };
-                    let lux = [
-                        baker.wall(cells(fx + pull_west, off), normal),
-                        baker.wall(cells(fx + 1.0 - pull_east, off), normal),
-                    ];
-                    g.upright(&heights, Vec2::new(west, face), Vec2::new(east, face), normal, [ca, cb_e], lux);
-                }
-                if ends_west {
-                    let lux = baker.wall(cells(fx - NUDGE, fy), Vec2::NEG_X);
-                    g.upright(&heights, Vec2::new(west, s), Vec2::new(west, n), Vec2::NEG_X, [ca, ca], [lux, lux]);
-                }
-                if ends_east {
-                    let lux = baker.wall(cells(fx + 1.0 + NUDGE, fy), Vec2::X);
-                    g.upright(&heights, Vec2::new(east, s), Vec2::new(east, n), Vec2::X, [cb_e, cb_e], [lux, lux]);
-                }
-            }
+            let (here, north, east) = (at_corner(x, y), at_corner(x, y + 1), at_corner(x + 1, y));
+            slab(&mut b, baker, Run::North, x, y, [here, north]);
+            slab(&mut b, baker, Run::East, x, y, [here, east]);
 
             // Pillar: the four sides of the cell, each lit from just outside.
             if plan.solid(x, y) {
+                let (fx, fy) = (x as f32, y as f32);
                 let (w, e, s, n) = (m(x), m(x + 1), m(y), m(y + 1));
-                let cc = at_corner(x + 1, y + 1);
+                let far_corner = at_corner(x + 1, y + 1);
                 let (near, far) = (NUDGE, 1.0 - NUDGE);
                 let sides = [
-                    (Vec2::new(w, s), Vec2::new(w, n), Vec2::NEG_X, [ca, cb_n], [(-near, near), (-near, far)]),
-                    (Vec2::new(e, s), Vec2::new(e, n), Vec2::X, [cb_e, cc], [(1.0 + near, near), (1.0 + near, far)]),
-                    (Vec2::new(w, s), Vec2::new(e, s), Vec2::NEG_Y, [ca, cb_e], [(near, -near), (far, -near)]),
-                    (Vec2::new(w, n), Vec2::new(e, n), Vec2::Y, [cb_n, cc], [(near, 1.0 + near), (far, 1.0 + near)]),
+                    (Vec2::new(w, s), Vec2::new(w, n), Vec2::NEG_X, [here, north], [(-near, near), (-near, far)]),
+                    (
+                        Vec2::new(e, s),
+                        Vec2::new(e, n),
+                        Vec2::X,
+                        [east, far_corner],
+                        [(1.0 + near, near), (1.0 + near, far)],
+                    ),
+                    (Vec2::new(w, s), Vec2::new(e, s), Vec2::NEG_Y, [here, east], [(near, -near), (far, -near)]),
+                    (
+                        Vec2::new(w, n),
+                        Vec2::new(e, n),
+                        Vec2::Y,
+                        [north, far_corner],
+                        [(near, 1.0 + near), (far, 1.0 + near)],
+                    ),
                 ];
-                for (a, b, normal, condition, samples) in sides {
-                    let lux = samples.map(|(dx, dy)| baker.wall(cells(fx + dx, fy + dy), normal));
-                    g.upright(&heights, a, b, normal, condition, lux);
+                for (from, to, facing, condition, samples) in sides {
+                    let lux = samples.map(|(dx, dy)| baker.wall(Vec2::new(fx + dx, fy + dy), facing));
+                    b.upright(from, to, facing, condition, lux, (0.0, ceiling), false);
                 }
             }
         }
     }
 
-    g
+    b.out
 }
 
 #[cfg(test)]
@@ -429,12 +570,91 @@ mod tests {
 
     #[test]
     fn a_pillar_replaces_its_floor_with_four_sides() {
-        let plan = TestPlan { pillars: vec![(8, 8)], west: vec![(8, 8), (9, 8)], south: vec![(8, 8), (8, 9)] };
+        let plan = TestPlan {
+            pillars: vec![(8, 8)],
+            west: vec![(8, 8), (9, 8)],
+            south: vec![(8, 8), (8, 9)],
+            ..Default::default()
+        };
         let g = build(&plan, &[]);
         assert_consistent(&g);
         // One cell loses floor and ceiling and gains four sides; the wall
         // edges the core puts around a pillar add nothing.
         assert_eq!(g.indices.len() / 3, 255 * 4 + 4 * STACK * 2);
+    }
+
+    /// Vertices of upright, non-trim faces: the wall surfaces proper.
+    fn wall_surface(g: &Geometry) -> Vec<Vec3> {
+        (0..g.positions.len())
+            .filter(|&i| g.normals[i][1].abs() < 0.5 && g.colors[i][3] > 0.5)
+            .map(|i| Vec3::from_array(g.positions[i]))
+            .collect()
+    }
+
+    #[test]
+    fn a_window_is_a_hole_between_sill_and_head() {
+        // Half a metre of wall, a one-metre window, half a metre of wall.
+        let plan = TestPlan { west: vec![(4, 3), (4, 6)], west_windows: vec![(4, 4), (4, 5)], ..Default::default() };
+        let g = build(&plan, &[]);
+        assert_consistent(&g);
+        // Over the window's length the wall surface stops at the sill and
+        // starts again at the head: nothing in between.
+        let surface = wall_surface(&g);
+        let over_window: Vec<&Vec3> = surface.iter().filter(|p| -p.z > 2.0 + 1e-3 && -p.z < 3.0 - 1e-3).collect();
+        assert!(!over_window.is_empty());
+        for p in &over_window {
+            assert!(p.y <= WINDOW_SILL + 1e-3 || p.y >= WINDOW_HEAD - 1e-3, "wall surface inside the opening at {p}");
+        }
+        assert!(over_window.iter().any(|p| (p.y - WINDOW_SILL).abs() < 1e-3));
+        assert!(over_window.iter().any(|p| (p.y - WINDOW_HEAD).abs() < 1e-3));
+        // The opening is lined with trim: a sill, a head and two jambs.
+        let trim: Vec<Vec3> = (0..g.positions.len())
+            .filter(|&i| g.colors[i][3] < 0.5)
+            .map(|i| Vec3::from_array(g.positions[i]))
+            .collect();
+        assert!(!trim.is_empty());
+        assert!(trim.iter().all(|p| p.y >= WINDOW_SILL - 1e-3 && p.y <= WINDOW_HEAD + 1e-3));
+        assert!(trim.iter().all(|p| (p.x - 2.0).abs() <= WALL_HALF + 1e-3), "trim stays within the wall's thickness");
+    }
+
+    #[test]
+    fn a_crawl_hole_is_open_at_the_floor() {
+        let plan = TestPlan { west: vec![(4, 3), (4, 6)], west_crawls: vec![(4, 4), (4, 5)], ..Default::default() };
+        let g = build(&plan, &[]);
+        assert_consistent(&g);
+        // Take the wall faces of the two crawl pieces: they start at the top
+        // of the hole, not at the floor.
+        let lowest = (0..g.positions.len())
+            .filter(|&i| g.normals[i][0].abs() > 0.5 && g.colors[i][3] > 0.5)
+            .map(|i| Vec3::from_array(g.positions[i]))
+            .filter(|p| -p.z > 2.0 + 0.01 && -p.z < 3.0 - 0.01)
+            .map(|p| p.y)
+            .fold(f32::MAX, f32::min);
+        // (No vertex lies strictly inside the two pieces' length except at
+        // their shared middle, at 2.5 m.)
+        assert!((lowest - CRAWL_HEIGHT).abs() < 1e-3, "crawl pieces start at {lowest} m");
+    }
+
+    #[test]
+    fn skew_moves_the_geometry_with_the_lattice() {
+        let push = Vec2::new(0.2, 0.1);
+        let plan = TestPlan { west: vec![(4, 4), (4, 5)], skews: vec![((4, 4), push)], ..Default::default() };
+        let g = build(&plan, &[]);
+        assert_consistent(&g);
+        // The floor corner on the bent lattice point (2 m, 2 m) has moved
+        // with it, and nothing is left behind at the old place.
+        let moved = plan_to_world(Vec2::splat(2.0) + push, 0.0);
+        let stayed = plan_to_world(Vec2::splat(2.0), 0.0);
+        let near = |target: Vec3| g.positions.iter().filter(|p| Vec3::from_array(**p).distance(target) < 1e-4).count();
+        assert!(near(moved) >= 4, "floor did not follow the lattice");
+        assert_eq!(near(stayed), 0);
+        // The wall that starts there is no longer square to the grid.
+        let slanted = (0..g.positions.len())
+            .filter(|&i| g.colors[i][3] > 0.5 && g.normals[i][1].abs() < 0.5)
+            .any(|i| g.normals[i][0].abs() > 0.5 && g.normals[i][2].abs() > 0.01);
+        assert!(slanted, "the wall stayed square");
+        // Far from the bent point nothing moved.
+        assert!(near(plan_to_world(Vec2::new(6.0, 6.0), 0.0)) >= 4);
     }
 
     #[test]

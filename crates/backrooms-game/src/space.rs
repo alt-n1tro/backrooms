@@ -132,28 +132,74 @@ impl ChunkCache {
 /// trait, so they can never disagree about where a wall is. Tests implement
 /// it with a hand-written plan.
 pub trait Plan {
-    /// Whether the core has a wall on the west side of cell `(x, y)`.
-    fn edge_west(&self, x: i32, y: i32) -> bool;
-    /// Whether the core has a wall on the south side of cell `(x, y)`.
-    fn edge_south(&self, x: i32, y: i32) -> bool;
+    /// What the core has on the west side of cell `(x, y)`.
+    fn west(&self, x: i32, y: i32) -> Edge;
+    /// What the core has on the south side of cell `(x, y)`.
+    fn south(&self, x: i32, y: i32) -> Edge;
     /// Whether cell `(x, y)` is a pillar.
     fn solid(&self, x: i32, y: i32) -> bool;
     /// Moisture and wear of cell `(x, y)`, each 0.0 to 1.0.
     fn condition(&self, x: i32, y: i32) -> Vec2;
+    /// How far the lattice point at cell corner `(x, y)` is out of true, in
+    /// metres. Only asked for corners where both coordinates are multiples
+    /// of four.
+    fn skew(&self, x: i32, y: i32) -> Vec2;
 
-    /// A wall slab running north-south on the west side of cell `(x, y)`.
+    /// The wall slab running north-south on the west side of cell `(x, y)`,
+    /// or `Edge::Open` if there is none.
     ///
     /// The core also marks the four edges of a pillar as walls. Those are
     /// left out here: a pillar is drawn and collided with as a solid block,
     /// not as four thin slabs.
-    fn wall_ns(&self, x: i32, y: i32) -> bool {
-        self.edge_west(x, y) && !self.solid(x, y) && !self.solid(x - 1, y)
+    fn slab_ns(&self, x: i32, y: i32) -> Edge {
+        if self.solid(x, y) || self.solid(x - 1, y) { Edge::Open } else { self.west(x, y) }
     }
 
-    /// A wall slab running east-west on the south side of cell `(x, y)`.
-    fn wall_ew(&self, x: i32, y: i32) -> bool {
-        self.edge_south(x, y) && !self.solid(x, y) && !self.solid(x, y - 1)
+    /// The wall slab running east-west on the south side of cell `(x, y)`.
+    fn slab_ew(&self, x: i32, y: i32) -> Edge {
+        if self.solid(x, y) || self.solid(x, y - 1) { Edge::Open } else { self.south(x, y) }
     }
+
+    /// How far the world is pushed out of true at `at` (a position in
+    /// cells), in metres.
+    ///
+    /// The core only says how far each point of the 2 m lattice has moved.
+    /// Everything in between moves by a blend of its four surrounding
+    /// lattice points, so walls stay straight between lattice points and
+    /// nothing tears. Add the result to a position to get where it really
+    /// is; almost everywhere it is zero.
+    fn warp(&self, at: Vec2) -> Vec2 {
+        let lattice = (at / LATTICE_CELLS).floor();
+        let t = at / LATTICE_CELLS - lattice;
+        let (x, y) = (lattice.x as i32 * LATTICE_STEP, lattice.y as i32 * LATTICE_STEP);
+        let south = self.skew(x, y).lerp(self.skew(x + LATTICE_STEP, y), t.x);
+        let north = self.skew(x, y + LATTICE_STEP).lerp(self.skew(x + LATTICE_STEP, y + LATTICE_STEP), t.x);
+        south.lerp(north, t.y)
+    }
+
+    /// The opposite of adding [`Plan::warp`]: given where something really
+    /// is (in cells), where it is on the undistorted plan.
+    ///
+    /// There is no formula for this, but the push is small and changes
+    /// slowly, so guessing and correcting a few times homes in on it.
+    fn unwarp(&self, real: Vec2) -> Vec2 {
+        let mut plan = real;
+        for _ in 0..4 {
+            plan = real - self.warp(plan) / CELL;
+        }
+        plan
+    }
+}
+
+/// Spacing of the wall lattice, in cells.
+const LATTICE_STEP: i32 = 4;
+const LATTICE_CELLS: f32 = LATTICE_STEP as f32;
+
+/// How much of a crawl hole's height a body may fill, and what is too tall
+/// to pass a given edge.
+pub fn blocks(edge: Edge, body_height: f32, ceiling: f32) -> bool {
+    let clearance = edge.clearance_mm((ceiling * 1000.0) as u16) as f32 / 1000.0;
+    body_height > clearance
 }
 
 /// Cells along one side of a chunk.
@@ -161,10 +207,8 @@ const N: i32 = backrooms_core::coord::CHUNK_SIZE;
 /// Cells along one side of a [`LocalPlan`]: three chunks, plus one for the
 /// far boundary edges.
 const SPAN: i32 = 3 * N + 1;
-
-const WEST: u8 = 1;
-const SOUTH: u8 = 2;
-const SOLID: u8 = 4;
+/// Lattice points along one side of a [`LocalPlan`].
+const LATTICE_SPAN: i32 = 3 * N / LATTICE_STEP + 1;
 
 /// A ceiling fixture as seen from a [`LocalPlan`].
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +217,16 @@ pub struct PlanFixture {
     /// also covers the cell east of it.
     pub cell: IVec2,
     pub state: LightState,
+}
+
+/// One cell of a [`LocalPlan`].
+#[derive(Clone, Copy, Default)]
+struct PlanCell {
+    west: Edge,
+    south: Edge,
+    solid: bool,
+    damp: u8,
+    wear: u8,
 }
 
 /// A flat copy of the floor plan of one chunk and its eight neighbours.
@@ -184,8 +238,9 @@ pub struct PlanFixture {
 pub struct LocalPlan {
     /// The cell that is `(0, 0)` here.
     pub base: CellPos,
-    flags: Vec<u8>,
-    condition: Vec<[u8; 2]>,
+    cells: Vec<PlanCell>,
+    /// Lattice displacement in metres, one entry per lattice point.
+    skew: Vec<Vec2>,
     pub fixtures: Vec<PlanFixture>,
 }
 
@@ -193,8 +248,8 @@ impl LocalPlan {
     pub fn around(cache: &ChunkCache, centre: ChunkPos) -> Self {
         let mut plan = Self {
             base: centre.origin(),
-            flags: vec![0; (SPAN * SPAN) as usize],
-            condition: vec![[0; 2]; (SPAN * SPAN) as usize],
+            cells: vec![PlanCell::default(); (SPAN * SPAN) as usize],
+            skew: vec![Vec2::ZERO; (LATTICE_SPAN * LATTICE_SPAN) as usize],
             fixtures: Vec::new(),
         };
         for cy in -1..=1 {
@@ -202,32 +257,31 @@ impl LocalPlan {
                 let chunk = cache.get(centre.offset(cx, cy));
                 let corner = IVec2::new(cx, cy) * N;
                 // Index 16 of a chunk's edge arrays is its far boundary. It
-                // is the same edge as index 0 of the next chunk, so writing
-                // both is harmless, and on the outer rim it is the only copy.
+                // is the same edge as index 0 of the next chunk, so both
+                // chunks write the same value there, and on the outer rim it
+                // is the only copy.
                 for ly in 0..=N {
                     for lx in 0..=N {
                         let (ux, uy) = (lx as usize, ly as usize);
-                        let mut flags = 0;
-                        if ly < N && chunk.west[uy][ux] == Edge::Wall {
-                            flags |= WEST;
+                        let cell = &mut plan.cells[Self::index(corner.x + lx, corner.y + ly).expect("inside the plan")];
+                        if ly < N {
+                            cell.west = chunk.west[uy][ux];
                         }
-                        if lx < N && chunk.south[uy][ux] == Edge::Wall {
-                            flags |= SOUTH;
+                        if lx < N {
+                            cell.south = chunk.south[uy][ux];
                         }
-                        let index = Self::index(corner.x + lx, corner.y + ly).expect("inside the plan");
                         if lx < N && ly < N {
-                            let cell = chunk.cells[uy][ux];
-                            if cell.solid {
-                                flags |= SOLID;
-                            }
-                            plan.condition[index] = [cell.damp, cell.wear];
-                            // A cell's own entry: replace whatever boundary
-                            // copy a neighbour wrote earlier.
-                            plan.flags[index] = flags;
-                        } else {
-                            // A boundary copy: add to it, never erase.
-                            plan.flags[index] |= flags;
+                            let core = chunk.cells[uy][ux];
+                            (cell.solid, cell.damp, cell.wear) = (core.solid, core.damp, core.wear);
                         }
+                    }
+                }
+                for (j, row) in chunk.skew.iter().enumerate() {
+                    for (i, skew) in row.iter().enumerate() {
+                        let (gx, gy) = ((cx + 1) * 4 + i as i32, (cy + 1) * 4 + j as i32);
+                        // The core counts in centimetres.
+                        plan.skew[(gy * LATTICE_SPAN + gx) as usize] =
+                            Vec2::new(skew.dx as f32, skew.dy as f32) / 100.0;
                     }
                 }
                 plan.fixtures.extend(
@@ -246,27 +300,36 @@ impl LocalPlan {
         ((0..SPAN).contains(&gx) && (0..SPAN).contains(&gy)).then(|| (gy * SPAN + gx) as usize)
     }
 
-    fn flag(&self, x: i32, y: i32, flag: u8) -> bool {
-        Self::index(x, y).is_some_and(|i| self.flags[i] & flag != 0)
+    fn cell(&self, x: i32, y: i32) -> PlanCell {
+        Self::index(x, y).map(|i| self.cells[i]).unwrap_or_default()
     }
 }
 
 impl Plan for LocalPlan {
-    fn edge_west(&self, x: i32, y: i32) -> bool {
-        self.flag(x, y, WEST)
+    fn west(&self, x: i32, y: i32) -> Edge {
+        self.cell(x, y).west
     }
 
-    fn edge_south(&self, x: i32, y: i32) -> bool {
-        self.flag(x, y, SOUTH)
+    fn south(&self, x: i32, y: i32) -> Edge {
+        self.cell(x, y).south
     }
 
     fn solid(&self, x: i32, y: i32) -> bool {
-        self.flag(x, y, SOLID)
+        self.cell(x, y).solid
     }
 
     fn condition(&self, x: i32, y: i32) -> Vec2 {
-        Self::index(x, y)
-            .map_or(Vec2::ZERO, |i| Vec2::new(self.condition[i][0] as f32, self.condition[i][1] as f32) / 255.0)
+        let cell = self.cell(x, y);
+        Vec2::new(cell.damp as f32, cell.wear as f32) / 255.0
+    }
+
+    fn skew(&self, x: i32, y: i32) -> Vec2 {
+        let (gx, gy) = (x.div_euclid(LATTICE_STEP) + 4, y.div_euclid(LATTICE_STEP) + 4);
+        if (0..LATTICE_SPAN).contains(&gx) && (0..LATTICE_SPAN).contains(&gy) {
+            self.skew[(gy * LATTICE_SPAN + gx) as usize]
+        } else {
+            Vec2::ZERO
+        }
     }
 }
 
@@ -315,14 +378,20 @@ mod tests {
                         for lx in 0..16 {
                             let (x, y) = (cx * 16 + lx, cy * 16 + ly);
                             let (ux, uy) = (lx as usize, ly as usize);
-                            assert_eq!(plan.edge_west(x, y), chunk.west[uy][ux] == Edge::Wall, "west {x},{y}");
-                            assert_eq!(plan.edge_south(x, y), chunk.south[uy][ux] == Edge::Wall, "south {x},{y}");
+                            assert_eq!(plan.west(x, y), chunk.west[uy][ux], "west {x},{y}");
+                            assert_eq!(plan.south(x, y), chunk.south[uy][ux], "south {x},{y}");
                             assert_eq!(plan.solid(x, y), chunk.cells[uy][ux].solid, "solid {x},{y}");
                         }
                         // The far boundary of the outermost chunks is covered too.
                         let (ux, far) = (ly as usize, 16usize);
-                        assert_eq!(plan.edge_west(cx * 16 + 16, cy * 16 + ly), chunk.west[ux][far] == Edge::Wall);
-                        assert_eq!(plan.edge_south(cx * 16 + ly, cy * 16 + 16), chunk.south[far][ux] == Edge::Wall);
+                        assert_eq!(plan.west(cx * 16 + 16, cy * 16 + ly), chunk.west[ux][far]);
+                        assert_eq!(plan.south(cx * 16 + ly, cy * 16 + 16), chunk.south[far][ux]);
+                    }
+                    for (j, row) in chunk.skew.iter().enumerate() {
+                        for (i, skew) in row.iter().enumerate() {
+                            let got = plan.skew(cx * 16 + i as i32 * 4, cy * 16 + j as i32 * 4);
+                            assert_eq!(got, Vec2::new(skew.dx as f32, skew.dy as f32) / 100.0);
+                        }
                     }
                 }
             }
@@ -332,8 +401,62 @@ mod tests {
                 .sum();
             assert_eq!(plan.fixtures.len(), expected);
             // Outside the three-by-three block everything is open floor.
-            assert!(!plan.edge_west(-17, 0) && !plan.solid(40, 40));
+            assert!(plan.west(-17, 0) == Edge::Open && !plan.solid(40, 40));
         }
+    }
+
+    /// A plan where one lattice point is pushed 20 cm east and 10 cm north.
+    struct Bent;
+
+    impl Plan for Bent {
+        fn west(&self, _: i32, _: i32) -> Edge {
+            Edge::Open
+        }
+        fn south(&self, _: i32, _: i32) -> Edge {
+            Edge::Open
+        }
+        fn solid(&self, _: i32, _: i32) -> bool {
+            false
+        }
+        fn condition(&self, _: i32, _: i32) -> Vec2 {
+            Vec2::ZERO
+        }
+        fn skew(&self, x: i32, y: i32) -> Vec2 {
+            if (x, y) == (4, 4) { Vec2::new(0.2, 0.1) } else { Vec2::ZERO }
+        }
+    }
+
+    #[test]
+    fn warp_is_exact_at_lattice_points_and_blends_between() {
+        assert_eq!(Bent.warp(Vec2::new(4.0, 4.0)), Vec2::new(0.2, 0.1));
+        assert_eq!(Bent.warp(Vec2::new(0.0, 4.0)), Vec2::ZERO);
+        assert_eq!(Bent.warp(Vec2::new(8.0, 8.0)), Vec2::ZERO);
+        // Halfway along a wall to the next lattice point: half the push.
+        assert_eq!(Bent.warp(Vec2::new(6.0, 4.0)), Vec2::new(0.1, 0.05));
+        // In the middle of a bay: a quarter.
+        assert_eq!(Bent.warp(Vec2::new(2.0, 2.0)), Vec2::new(0.05, 0.025));
+        // Well away from the bent point nothing moves.
+        assert_eq!(Bent.warp(Vec2::new(-3.0, 13.0)), Vec2::ZERO);
+    }
+
+    #[test]
+    fn unwarp_undoes_warp() {
+        for plan_pos in [Vec2::new(4.0, 4.0), Vec2::new(3.1, 5.7), Vec2::new(6.9, 2.2), Vec2::new(20.0, 20.0)] {
+            let real = plan_pos + Bent.warp(plan_pos) / CELL;
+            assert!(Bent.unwarp(real).distance(plan_pos) < 1e-3, "{plan_pos} did not come back");
+        }
+    }
+
+    #[test]
+    fn bodies_fit_through_what_they_should() {
+        let ceiling = 2.6;
+        assert!(!blocks(Edge::Open, 1.75, ceiling));
+        assert!(blocks(Edge::Wall, 0.6, ceiling));
+        assert!(blocks(Edge::Window, 0.6, ceiling));
+        // A crawl hole stops anyone standing or crouching, but not crawling.
+        assert!(blocks(Edge::Crawl, 1.75, ceiling));
+        assert!(blocks(Edge::Crawl, 1.1, ceiling));
+        assert!(!blocks(Edge::Crawl, 0.6, ceiling));
     }
 
     #[test]

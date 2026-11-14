@@ -4,10 +4,10 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.3.1** (milestone 3 of 9: performance pass). See
+Current version: **0.4.0** (milestone 4a: Level 0 anomalies). See
 [CHANGELOG.md](CHANGELOG.md).
 
-![Level 0 at the origin](docs/level0-walk.png)
+![A window in a Level 0 wall](docs/level0-walk.png)
 
 ## Layout
 
@@ -40,7 +40,9 @@ take seconds.
 | Click | Capture the mouse and look around |
 | W A S D or arrows | Walk |
 | W twice, then hold (or Shift) | Sprint |
-| Space | Jump |
+| Space | Jump (or get back up) |
+| C | Crouch |
+| X | Crawl, to get through low holes in walls |
 | F11 or F | Fullscreen |
 | F3 or ` (left of 1) | Show frame rate, render size and version |
 | Escape | Release the mouse |
@@ -59,15 +61,10 @@ cargo run --release -p backrooms-game -- --x 2000000000 --y -2000000000
 cargo run --release -p backrooms-game -- --random
 ```
 
-The 3D view is drawn at up to about 1080p and stretched to fit larger
-windows. If it still runs slowly, press F3 to see the frame rate, then draw
-fewer pixels and less far:
-
-```bash
-cargo run --release -p backrooms-game -- --render-scale 0.5 --view 3
-```
-
-For the sharpest picture on a fast GPU, use `--render-scale 1`.
+The 3D view is drawn at a reduced size and stretched to fit the window. The
+size adjusts itself while you play to hold 60 frames a second; F3 shows what
+it settled on. To fix it yourself, use `--render-scale 0.5` (faster, softer)
+up to `--render-scale 1` (native), and `--view 3` to draw less far.
 
 Other options: `--sensitivity 1.5` (mouse speed), `--hum 0` (silence the
 lights), `--fps 60` (frame-rate cap, default 120), `--vsync`. `--help` lists
@@ -88,8 +85,20 @@ cargo run --release -p backrooms-cli -- chunk --x 0 --y 0
 cargo run --release -p backrooms-cli -- stack
 ```
 
+To find the rare things, ask where the nearest ones are. Each line of the
+answer is a set of options to start the game with:
+
+```bash
+cargo run --release -p backrooms-cli -- find crawl
+```
+
+`find` also takes `window` and `skew`, and `--x`/`--y` to search around
+somewhere other than the origin.
+
 Map legend: white lights are on, orange flicker, grey are dead; dark squares
-are pillars; brown patches are damp carpet. One chunk is 16 x 16 cells, 8 m
+are pillars; brown patches are damp carpet. Blue wall pieces are windows,
+green are crawl holes, and magenta dots mark lattice points that are out of
+true. One chunk is 16 x 16 cells, 8 m
 on a side. `--chunks 512` draws 4 km x 4 km.
 
 ![Level 0 around the origin, 96 m across](docs/level0-sample.png)

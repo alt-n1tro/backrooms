@@ -160,15 +160,20 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let height = in.world_position.y;
     let cells_per_pixel = max(length(fwidth(plan)), fwidth(height) * 2.0);
 
-    // The mesher stores moisture in red, wear in green and baked light (in
-    // thousands of lux) in blue.
+    // The mesher stores moisture in red, wear in green, baked light (in
+    // thousands of lux) in blue, and 0 in alpha for trim.
     let damp = in.color.r;
     let wear = in.color.g;
     let lux = in.color.b * 1000.0;
 
     let n = in.world_normal;
     var look: Look;
-    if n.y > 0.5 {
+    if in.color.a < 0.5 {
+        // Trim: the inside of a window or crawl hole, painted like the
+        // skirting board.
+        let grain = cloud(cell, f, 50u);
+        look = Look(vec3<f32>(0.20, 0.13, 0.03) * (0.8 + 0.4 * grain), 0.6);
+    } else if n.y > 0.5 {
         look = carpet(cell, f, damp, wear, cells_per_pixel);
     } else if n.y < -0.5 {
         look = tiles(cell, f, damp, wear, cells_per_pixel);

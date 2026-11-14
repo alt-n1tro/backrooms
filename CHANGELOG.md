@@ -4,6 +4,43 @@ Every delivery gets a version (MAJOR.MINOR.PATCH), however small the change.
 "Generator" lines say whether the world itself changed: once generator v1
 ships, any such change will require a new generator version instead.
 
+## 0.4.0 — Milestone 4a: Level 0 anomalies
+
+Milestone 4 is delivered in three steps. This is the first; portals (4b) and
+the 64 yellow variants (4c) follow.
+
+World (generator v1 changed; golden hashes re-blessed):
+
+- Rarity tiers: every site rolls into at most one of six tiers, each eight
+  times rarer than the last, from 1 in 32 to 1 in 1,048,576.
+- Interior windows: a common roll puts an unglazed opening in the middle
+  metre of a complete 2 m wall piece.
+- Crawl holes: an uncommon roll puts a 0.7 m high hole there instead.
+- Skewed walls: in zones marked by a slow "wrongness" noise, points of the
+  2 m wall lattice are pushed up to 28 cm out of true, so walls stop being
+  parallel.
+- None of these changes where a walking player can go, so every earlier
+  guarantee (no sealed rooms, 1 m openings, connectivity) still holds.
+
+Game:
+
+- Crouch (C) and crawl (X); Space gets back up. Getting up waits until
+  there is room. Only a crawling body fits a crawl hole.
+- Wall slabs are built with their openings, lined with trim.
+- Baked light passes partly through windows and crawl holes.
+- Skewed zones are drawn and walked through consistently.
+- The automatic render scale now follows the frame rate, shrinking or
+  growing the 3D picture to hold 60 frames a second.
+
+Tools:
+
+- `backrooms find window|crawl|skew` lists the nearest ones with the
+  options to start the game looking at each.
+- Maps and chunk text show windows, crawl holes and skewed lattice points.
+
+Not in this step: tilted floors (they need height-aware collision, which
+arrives with stairs and slides) and portals.
+
 ## 0.3.1
 
 - The running version is shown in the window title, printed at start-up and
