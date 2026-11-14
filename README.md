@@ -4,10 +4,10 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.4.0** (milestone 4a: Level 0 anomalies). See
+Current version: **0.5.0** (rooms, corridors and secret rooms). See
 [CHANGELOG.md](CHANGELOG.md).
 
-![A window in a Level 0 wall](docs/level0-walk.png)
+![A doorway and a hall in Level 0](docs/level0-walk.png)
 
 ## Layout
 
@@ -41,8 +41,8 @@ take seconds.
 | W A S D or arrows | Walk |
 | W twice, then hold (or Shift) | Sprint |
 | Space | Jump (or get back up) |
-| C | Crouch |
-| X | Crawl, to get through low holes in walls |
+| C or Ctrl | Crouch; walk into a low hole while crouched to crawl through |
+| X or Z | Crawl |
 | F11 or F | Fullscreen |
 | F3 or ` (left of 1) | Show frame rate, render size and version |
 | Escape | Release the mouse |
@@ -97,7 +97,7 @@ somewhere other than the origin.
 
 Map legend: white lights are on, orange flicker, grey are dead; dark squares
 are pillars; brown patches are damp carpet. Blue wall pieces are windows,
-green are crawl holes, and magenta dots mark lattice points that are out of
+green are crawl holes (each leads to a secret room), and magenta dots mark lattice points that are out of
 true. One chunk is 16 x 16 cells, 8 m
 on a side. `--chunks 512` draws 4 km x 4 km.
 

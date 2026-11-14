@@ -15,7 +15,7 @@ use bevy::window::{CursorGrabMode, CursorOptions};
 
 use crate::collide::{Body, slide};
 use crate::screen::Screen;
-use crate::space::{CELL, ChunkCache, LocalPlan, Plan, RenderOrigin, plan_to_world, world_to_plan};
+use crate::space::{ChunkCache, LocalPlan, RenderOrigin, plan_to_world, world_to_plan};
 use crate::world::{Anchored, Ceiling, ViewDistance};
 
 const RADIUS: f32 = 0.22;
@@ -80,8 +80,8 @@ impl Posture {
 
 /// The posture the keys ask for this frame, given the one asked for before.
 ///
-/// C toggles crouching, X toggles crawling, and Space gets you back on your
-/// feet. Kept as a plain function so the rules can be tested.
+/// C (or Ctrl) toggles crouching, X (or Z) toggles crawling, and Space gets
+/// you back on your feet. Kept as a plain function so the rules can be tested.
 fn wanted_posture(wanted: Posture, crouch: bool, crawl: bool, rise: bool) -> Posture {
     if rise {
         Posture::Standing
@@ -281,8 +281,9 @@ pub fn walk(
     // Space jumps when standing; when down low it means "get up" instead.
     let space = keys.just_pressed(KeyCode::Space);
     let low = player.posture != Posture::Standing;
-    player.wanted =
-        wanted_posture(player.wanted, keys.just_pressed(KeyCode::KeyC), keys.just_pressed(KeyCode::KeyX), space && low);
+    let crouch = keys.any_just_pressed([KeyCode::KeyC, KeyCode::ControlLeft, KeyCode::ControlRight]);
+    let crawl = keys.any_just_pressed([KeyCode::KeyX, KeyCode::KeyZ]);
+    player.wanted = wanted_posture(player.wanted, crouch, crawl, space && low);
     if space && !low && player.height == 0.0 {
         player.rising = JUMP_SPEED;
     }
@@ -300,17 +301,13 @@ pub fn walk(
     let plan = surroundings.0.as_ref().expect("set just above");
     // The snapshot measures from its own corner, not from the render origin.
     let corner = origin.plan_of(plan.base);
-    // Where the lattice is out of true, what is drawn has been pushed off
-    // the plan. Collision is done on the undistorted plan, so the player's
-    // real position is pulled back onto it first and pushed out again after.
-    // Almost everywhere both steps change nothing.
-    let on_plan = plan.unwarp((from - corner) / CELL) * CELL;
+    let here = from - corner;
     let body = |posture: Posture| Body { radius: RADIUS, height: posture.body_height(), ceiling: ceiling.0 };
 
     // Change posture. Getting lower always works; getting up needs room,
     // and until there is room the request simply waits.
     if player.wanted != player.posture && player.height == 0.0 {
-        let fits = |posture: Posture| slide(plan, on_plan, Vec2::ZERO, body(posture)).distance(on_plan) < 1e-3;
+        let fits = |posture: Posture| slide(plan, here, Vec2::ZERO, body(posture)).distance(here) < 1e-3;
         if player.wanted < player.posture || fits(player.wanted) {
             player.posture = player.wanted;
         } else if player.posture == Posture::Crawling && fits(Posture::Crouching) {
@@ -319,8 +316,18 @@ pub fn walk(
         }
     }
 
-    let moved = slide(plan, on_plan, player.velocity * dt, body(player.posture));
-    let to = moved + plan.warp(moved / CELL) + corner;
+    let step = player.velocity * dt;
+    let mut moved = slide(plan, here, step, body(player.posture));
+    // Crouched and pushing at a crawl hole: drop to hands and knees rather
+    // than make the player find another key.
+    if player.posture == Posture::Crouching && step != Vec2::ZERO {
+        let crawled = slide(plan, here, step, body(Posture::Crawling));
+        if (crawled - moved).dot(step) > 1e-4 {
+            (player.posture, player.wanted) = (Posture::Crawling, Posture::Crawling);
+            moved = crawled;
+        }
+    }
+    let to = moved + corner;
     // What actually happened is the velocity: walking into a wall stops you.
     if dt > 0.0 {
         player.velocity = (to - from) / dt;

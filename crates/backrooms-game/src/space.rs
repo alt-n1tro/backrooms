@@ -176,19 +176,6 @@ pub trait Plan {
         let north = self.skew(x, y + LATTICE_STEP).lerp(self.skew(x + LATTICE_STEP, y + LATTICE_STEP), t.x);
         south.lerp(north, t.y)
     }
-
-    /// The opposite of adding [`Plan::warp`]: given where something really
-    /// is (in cells), where it is on the undistorted plan.
-    ///
-    /// There is no formula for this, but the push is small and changes
-    /// slowly, so guessing and correcting a few times homes in on it.
-    fn unwarp(&self, real: Vec2) -> Vec2 {
-        let mut plan = real;
-        for _ in 0..4 {
-            plan = real - self.warp(plan) / CELL;
-        }
-        plan
-    }
 }
 
 /// Spacing of the wall lattice, in cells.
@@ -437,14 +424,6 @@ mod tests {
         assert_eq!(Bent.warp(Vec2::new(2.0, 2.0)), Vec2::new(0.05, 0.025));
         // Well away from the bent point nothing moves.
         assert_eq!(Bent.warp(Vec2::new(-3.0, 13.0)), Vec2::ZERO);
-    }
-
-    #[test]
-    fn unwarp_undoes_warp() {
-        for plan_pos in [Vec2::new(4.0, 4.0), Vec2::new(3.1, 5.7), Vec2::new(6.9, 2.2), Vec2::new(20.0, 20.0)] {
-            let real = plan_pos + Bent.warp(plan_pos) / CELL;
-            assert!(Bent.unwarp(real).distance(plan_pos) < 1e-3, "{plan_pos} did not come back");
-        }
     }
 
     #[test]

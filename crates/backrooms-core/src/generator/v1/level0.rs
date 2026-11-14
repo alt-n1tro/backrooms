@@ -2,44 +2,44 @@
 //!
 //! # Layout
 //!
-//! Walls stand only on the lines of a 2 m lattice (every 4 cells), which
-//! divides the floor into 2 m x 2 m **bays**. A piece of lattice line between
-//! two neighbouring lattice points is a **segment**: 4 cell edges long.
+//! The level is an endless office floor drawn by something that has seen
+//! floor plans but never worked in a building.
 //!
-//! Three nested lattices decide where walls go: 2 m, 4 m and 8 m. On each
-//! one, every lattice-sized stretch of line is independently a wall or not,
-//! by a hash of its own position. Long 8 m walls give the space its
-//! structure; the finer ones subdivide it. How likely a wall is at each scale
-//! depends on a slowly varying **density** noise, so the level drifts between
-//! open pillar halls and tight warrens. A wall may have a doorway, and a
-//! doorway always wins over a wall from another scale.
+//! The plane is cut into **blocks** 32 m square. Each block is divided the
+//! way an architect divides a floor: cut the space in two, then cut each
+//! part again, until the parts are room-sized. Often a cut leaves a 2 m
+//! strip between the two halves, which becomes a **corridor**. The parts
+//! that are not cut further are the **rooms**. A slow **density** noise sets
+//! how far each block is cut up, so the level drifts between open halls with
+//! grids of columns and warrens of small offices.
 //!
-//! # No sealed rooms
+//! Every cut is a wall, on the 2 m lattice (every 4 cells), and every wall
+//! gets at least one doorway. So each division joins its two sides, the
+//! walls between blocks get doorways the same way, and by induction every
+//! ordinary room can be walked to from every other.
 //!
-//! Every bay owns its north and its east segment. If both come out
-//! impassable, a doorway is carved into one of them. So from any bay you can
-//! always move north or east, which rules out sealed boxes, and since two
-//! such north-east paths wander into each other sooner or later, the whole
-//! level is connected in practice (a test checks a large sample).
+//! Everything is a pure function of position: to find what stands between
+//! two neighbouring 2 m bays, the generator replays the cuts of their block
+//! from the top until one separates them. Nothing is stored.
 //!
-//! Each segment is owned by exactly one bay, so this fix-up needs no
-//! knowledge of the neighbours' decisions and chunks still agree on seams.
+//! # Secret rooms
+//!
+//! A rare small room is **secret**: no doorway may touch it, and exactly one
+//! piece of its wall has a crawl hole instead. Crawl holes exist nowhere
+//! else, so finding one always means finding a room that cannot be walked
+//! into.
 //!
 //! # Guarantee
 //!
-//! Every opening is at least 2 cells (1 m) wide. A doorway never straddles a
-//! lattice point, so no wall ever ends in the middle of one.
+//! Every opening is at least 2 cells (1 m) wide and lies within one 2 m
+//! piece of wall, so no wall ever ends in the middle of a doorway.
 //!
 //! # Oddities
 //!
-//! The level copies a building without understanding one. Every complete
-//! 2 m piece of wall rolls a [`Rarity`]: a common roll puts an unglazed
-//! window in its middle metre, an uncommon one a crawl hole. Neither changes
-//! where a walking player can go, so the guarantees above still hold.
-//!
-//! Separately, a slow **wrongness** noise marks out zones where the wall
-//! lattice itself is out of true: each lattice point there is pushed a few
-//! centimetres off its place, so walls stop being parallel.
+//! A plain wall piece occasionally has an unglazed window in its middle
+//! metre. Separately, a slow **wrongness** noise marks out zones where the
+//! wall lattice itself is out of true: each lattice point there is pushed a
+//! few centimetres off its place, so walls stop being parallel.
 
 use super::{level_key, purpose};
 use crate::GeneratorVersion;
@@ -55,9 +55,9 @@ pub const BAY: i32 = 4;
 const BAY_SHIFT: u32 = 2;
 /// Bays along one side of a chunk.
 const BAYS: i32 = CHUNK_SIZE / BAY;
-/// Number of nested wall lattices (2 m, 4 m, 8 m).
-const SCALES: usize = 3;
-/// Pillars stand on the 4 m lattice.
+/// Side of a block in cells (32 m).
+pub const BLOCK: i32 = 64;
+/// Columns stand on every other lattice point.
 const PILLAR_PITCH: i32 = 8;
 
 /// The knobs of the yellow-room generator. The 64 yellow levels will be 64
@@ -65,15 +65,22 @@ const PILLAR_PITCH: i32 = 8;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Params {
     pub ceiling_mm: u16,
-    /// Chance of a wall on a stretch of the 2 m, 4 m and 8 m lattice, each
-    /// given at lowest, middle and highest density.
-    pub wall: [[Q16; 3]; SCALES],
-    /// Chance that a wall at each scale has a doorway.
-    pub door: [Q16; SCALES],
-    /// Chance of a pillar at a free 4 m lattice point, at lowest density.
-    /// Falls linearly to zero at `pillar_until`.
-    pub pillar: Q16,
-    pub pillar_until: Q16,
+    /// A space is cut further while it is longer than this many bays, in
+    /// the most open blocks and in the densest.
+    pub room_limit: [u8; 2],
+    /// Chance that a cut leaves a corridor between its two sides, in the
+    /// most open blocks and in the densest.
+    pub corridor: [Q16; 2],
+    /// Chance of a doorway at each place along a wall, beyond the one every
+    /// wall is guaranteed.
+    pub extra_door: Q16,
+    /// Chance that a cut is left without a wall at all, in the most open
+    /// blocks and in the densest.
+    pub open_plan: [Q16; 2],
+    /// Chance that a doorway is the full 2 m wide instead of 1 m.
+    pub wide_door: Q16,
+    /// Chance that a hall (a room at least 8 m both ways) has columns.
+    pub pillars: Q16,
     /// Chance that a ceiling grid position has no fixture at all.
     pub fixture_missing: Q16,
     /// Chance of a dead tube in a healthy area and in the worst of a failing
@@ -99,10 +106,12 @@ pub struct Params {
 
 pub const LEVEL_0: Params = Params {
     ceiling_mm: 2600,
-    wall: [[pct(0), pct(5), pct(38)], [pct(6), pct(30), pct(52)], [pct(38), pct(56), pct(66)]],
-    door: [pct(25), pct(50), pct(70)],
-    pillar: pct(75),
-    pillar_until: pct(42),
+    room_limit: [9, 3],
+    corridor: [pct(25), pct(75)],
+    extra_door: pct(10),
+    open_plan: [pct(22), pct(3)],
+    wide_door: pct(30),
+    pillars: pct(70),
     fixture_missing: pct(6),
     dead: [pct(2), pct(55)],
     dead_floor: pct(78),
@@ -116,12 +125,12 @@ pub const LEVEL_0: Params = Params {
     skew_cm: 28,
 };
 
-/// Which way a segment runs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Which way a wall piece runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Axis {
-    /// Along a line of constant x: a wall between a west and an east cell.
+    /// Along a line of constant x: a wall between a west and an east bay.
     NorthSouth = 0,
-    /// Along a line of constant y: a wall between a south and a north cell.
+    /// Along a line of constant y: a wall between a south and a north bay.
     EastWest = 1,
 }
 
@@ -135,6 +144,92 @@ pub enum RegionLighting {
     Blackout,
 }
 
+/// A rectangle of floor, in cells: `x0..x1` by `y0..y1`. All four are
+/// multiples of [`BAY`]. Coordinates are relative to the block's corner, so
+/// they never wrap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Rect {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+}
+
+impl Rect {
+    const fn bays_wide(self) -> i32 {
+        (self.x1 - self.x0) / BAY
+    }
+    const fn bays_deep(self) -> i32 {
+        (self.y1 - self.y0) / BAY
+    }
+    const fn contains(self, x: i32, y: i32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+}
+
+/// What a room is, as far as the layout cares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomKind {
+    Room,
+    /// A 2 m wide strip left between the two sides of a cut, running east.
+    CorridorEast,
+    /// The same, running north.
+    CorridorNorth,
+    /// A room no doorway leads to; see the module docs.
+    Secret,
+}
+
+/// A room: a part of a block that is not cut any further.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Room {
+    /// Cell at the block's south-west corner; the rectangle is relative to
+    /// it.
+    block: CellPos,
+    rect: Rect,
+    /// Identifies the room. Later milestones hash it for furniture and use.
+    pub key: Key,
+    pub kind: RoomKind,
+}
+
+impl Room {
+    /// Size in bays (2 m each): east-west, then north-south.
+    pub const fn size(&self) -> (i32, i32) {
+        (self.rect.bays_wide(), self.rect.bays_deep())
+    }
+
+    /// The room's south-west cell.
+    pub const fn corner(&self) -> CellPos {
+        self.block.offset(self.rect.x0, self.rect.y0)
+    }
+}
+
+/// How a space is cut: across which axis and where. A corridor cut has two
+/// lines with the corridor between them; a plain cut has `from == to`.
+#[derive(Clone, Copy)]
+struct Cut {
+    /// True if the cut lines run north-south (dividing east from west).
+    vertical: bool,
+    /// Cell coordinates of the first and second line.
+    from: i32,
+    to: i32,
+}
+
+/// A wall line found between two neighbouring bays.
+#[derive(Clone, Copy)]
+struct Line {
+    key: Key,
+    /// Cell at the block's corner, and the line's extent relative to it:
+    /// `at` across, `lo..lo + 4 * len` along.
+    block: CellPos,
+    vertical: bool,
+    at: i32,
+    lo: i32,
+    /// Length in bays.
+    len: i32,
+    /// True for a wall between two blocks.
+    boundary: bool,
+}
+
 /// Everything derived from `(params, level)`, built once per chunk.
 struct Gen<'a> {
     p: &'a Params,
@@ -145,23 +240,10 @@ struct Gen<'a> {
     wear: Field,
     wrongness: Field,
     wall: Key,
-    carve: Key,
-    pillar: Key,
     fixture: Key,
     region_lighting: Key,
     feature: Key,
     skew: Key,
-}
-
-/// 4-bit mask of a segment: bit `b` set means the cell edge `b` cells along
-/// the segment (from its south or west end) is a wall.
-type Mask = u8;
-const FULL: Mask = 0b1111;
-
-/// A player can pass a segment if it has two adjacent open cell edges (1 m).
-const fn passable(mask: Mask) -> bool {
-    let open = !mask & FULL;
-    open & (open >> 1) != 0
 }
 
 impl<'a> Gen<'a> {
@@ -176,8 +258,8 @@ impl<'a> Gen<'a> {
         };
         Self {
             p,
-            // 64 m zones of open versus dense layout.
-            density: field(purpose::DENSITY, 7, 3, 6, 40, 620),
+            // 128 m zones of open versus dense layout.
+            density: field(purpose::DENSITY, 8, 2, 7, 60, 640),
             // 128 m zones of failing power.
             power: field(purpose::POWER, 8, 2, 7, 48, 700),
             // 32 m pockets of flickering tubes.
@@ -189,8 +271,6 @@ impl<'a> Gen<'a> {
             // 64 m zones where the geometry goes subtly wrong.
             wrongness: field(purpose::WRONGNESS, 7, 2, 6, 24, 640),
             wall: level_key(level, purpose::WALL),
-            carve: level_key(level, purpose::CARVE),
-            pillar: level_key(level, purpose::PILLAR),
             fixture: level_key(level, purpose::FIXTURE),
             region_lighting: level_key(level, purpose::REGION_LIGHTING),
             feature: level_key(level, purpose::FEATURE),
@@ -198,100 +278,233 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// Wall probability at lattice `scale` for density `d`: a straight line
-    /// from the low value to the middle value, then on to the high value.
-    fn wall_chance(&self, scale: usize, d: Q16) -> Q16 {
-        let [low, mid, high] = self.p.wall[scale];
-        if d < ONE / 2 { lerp(low, mid, d * 2) } else { lerp(mid, high, (d - ONE / 2) * 2) }
+    /// The corner of the block containing cell `(x, y)`.
+    fn block_of(x: i32, y: i32) -> CellPos {
+        CellPos::new(x & !(BLOCK - 1), y & !(BLOCK - 1))
     }
 
-    /// The walls on one segment before the no-sealed-rooms fix-up.
-    ///
-    /// `(x, y)` is the cell at the segment's south or west end; both
-    /// coordinates are multiples of [`BAY`].
-    fn raw_segment(&self, axis: Axis, x: i32, y: i32) -> Mask {
-        let (line, along) = match axis {
-            Axis::NorthSouth => (x, y),
-            Axis::EastWest => (y, x),
+    /// How densely a block is divided, 0 (open halls) to 65535 (warren).
+    /// One value per block, so a block has one character throughout.
+    fn block_density(&self, block: CellPos) -> Q16 {
+        let middle = block.offset(BLOCK / 2, BLOCK / 2);
+        self.density.sample(middle.x, middle.y)
+    }
+
+    fn block_key(&self, block: CellPos) -> Key {
+        self.wall.with(0).with_xy(block.x, block.y)
+    }
+
+    /// How (and whether) the space `rect` of a block is cut. `None` means it
+    /// is a room.
+    fn cut(&self, rect: Rect, key: Key, density: Q16) -> Option<Cut> {
+        let (w, h) = (rect.bays_wide(), rect.bays_deep());
+        let roll = key.roll();
+        // Spaces are cut until they fit the block's room size, give or take
+        // a bay so that rooms in one block are not all alike.
+        let limit = lerp(self.p.room_limit[0] as u32, self.p.room_limit[1] as u32, density) as i32;
+        let limit = (limit + roll.below(3) as i32 - 1).max(1);
+        let long = if w > h { w } else { h };
+        // A strip one bay wide is a corridor or a closet: never cut along
+        // its length into slivers, only across.
+        if long <= limit || long < 2 {
+            return None;
+        }
+        // Cut across the longer side; a square is cut either way.
+        let vertical = if w != h { w > h } else { roll.next().chance(ONE / 2) };
+        let start = if vertical { rect.x0 } else { rect.y0 };
+        let roll = roll.next().next();
+
+        let corridor_chance = lerp(self.p.corridor[0], self.p.corridor[1], density);
+        if long >= 5 && roll.chance(corridor_chance) {
+            // A corridor one bay wide, with at least two bays either side.
+            let first = 2 + roll.below((long - 4) as u32) as i32;
+            return Some(Cut { vertical, from: start + first * BAY, to: start + (first + 1) * BAY });
+        }
+        // A plain cut, leaving at least two bays either side where there is
+        // room for that.
+        let margin = if long >= 4 { 2 } else { 1 };
+        let at = start + (margin + roll.below((long - 2 * margin + 1) as u32) as i32) * BAY;
+        Some(Cut { vertical, from: at, to: at })
+    }
+
+    /// The parts a cut divides `rect` into: two, or three with a corridor in
+    /// the middle. Unused entries are `None`.
+    fn parts(rect: Rect, cut: Cut) -> [Option<Rect>; 3] {
+        let strip = |a: i32, b: i32| {
+            if cut.vertical { Rect { x0: a, x1: b, ..rect } } else { Rect { y0: a, y1: b, ..rect } }
         };
-        let mut walls: Mask = 0;
-        let mut doors: Mask = 0;
-        for scale in 0..SCALES {
-            let pitch = BAY << scale;
-            // The lattices nest: a line that is not on this lattice is not on
-            // any coarser one either.
-            if line & (pitch - 1) != 0 {
+        let (start, end) = if cut.vertical { (rect.x0, rect.x1) } else { (rect.y0, rect.y1) };
+        if cut.from == cut.to {
+            [Some(strip(start, cut.from)), Some(strip(cut.from, end)), None]
+        } else {
+            [Some(strip(start, cut.from)), Some(strip(cut.from, cut.to)), Some(strip(cut.to, end))]
+        }
+    }
+
+    /// The room containing cell `(x, y)`.
+    fn room_at(&self, x: i32, y: i32) -> Room {
+        let block = Self::block_of(x, y);
+        let density = self.block_density(block);
+        let (lx, ly) = (x & (BLOCK - 1), y & (BLOCK - 1));
+        let mut rect = Rect { x0: 0, y0: 0, x1: BLOCK, y1: BLOCK };
+        let mut key = self.block_key(block);
+        let mut kind = RoomKind::Room;
+        while let Some(cut) = self.cut(rect, key, density) {
+            let parts = Self::parts(rect, cut);
+            let (index, part) = parts
+                .iter()
+                .enumerate()
+                .find_map(|(i, part)| part.filter(|p| p.contains(lx, ly)).map(|p| (i, p)))
+                .expect("the parts of a cut cover the whole space");
+            rect = part;
+            key = key.with(index as u64 + 1);
+            // The middle part of a three-way cut is the corridor. A
+            // corridor is never cut again: it runs the full length of the
+            // space it was laid in.
+            if parts[2].is_some() && index == 1 {
+                kind = if cut.vertical { RoomKind::CorridorNorth } else { RoomKind::CorridorEast };
                 break;
             }
-            // The stretch of this scale that contains the segment, and which
-            // of its 2 m pieces the segment is.
-            let start = along & !(pitch - 1);
-            let piece = ((along & (pitch - 1)) >> BAY_SHIFT) as u32;
-            let middle = start.wrapping_add(pitch / 2);
-            let (sx, sy, mx, my) = match axis {
-                Axis::NorthSouth => (line, start, line, middle),
-                Axis::EastWest => (start, line, middle, line),
-            };
-
-            let roll = self.wall.with(axis as u64 | (scale as u64) << 8).with_xy(sx, sy).roll();
-            if !roll.chance(self.wall_chance(scale, self.density.sample(mx, my))) {
-                continue;
-            }
-            walls = FULL;
-
-            let roll = roll.next();
-            if !roll.chance(self.p.door[scale]) {
-                continue;
-            }
-            // The doorway sits inside one 2 m piece of the wall.
-            let roll = roll.next();
-            if roll.below(1 << scale) == piece {
-                doors |= door_mask(roll.next());
-            }
         }
-        walls & !doors
+        // A small ordinary room is occasionally secret.
+        let small = rect.bays_wide() * rect.bays_deep() <= 6;
+        if kind == RoomKind::Room && small && Rarity::of(key.with(0x5EC).roll()).is_some() {
+            kind = RoomKind::Secret;
+        }
+        Room { block, rect, key, kind }
     }
 
-    /// The final north and east segments of the bay whose south-west cell is
-    /// `(x, y)`, after carving an exit if the bay would have none.
-    fn bay_exits(&self, x: i32, y: i32) -> (Mask, Mask) {
-        let north = self.raw_segment(Axis::EastWest, x, y.wrapping_add(BAY));
-        let east = self.raw_segment(Axis::NorthSouth, x.wrapping_add(BAY), y);
-        if passable(north) || passable(east) {
-            return (north, east);
+    /// The wall line that separates the two bays on either side of the
+    /// piece at `(x, y)`, or `None` if they are in the same room.
+    fn line_between(&self, axis: Axis, x: i32, y: i32) -> Option<Line> {
+        let vertical = axis == Axis::NorthSouth;
+        // The bay on the low side (west or south) and on the high side.
+        let (ax, ay) = if vertical { (x.wrapping_sub(BAY), y) } else { (x, y.wrapping_sub(BAY)) };
+        let (block_a, block_b) = (Self::block_of(ax, ay), Self::block_of(x, y));
+        if block_a != block_b {
+            // The wall between two blocks: a line the length of a block.
+            let key = self.wall.with(1 + axis as u64).with_xy(block_b.x, block_b.y);
+            return Some(Line { key, block: block_b, vertical, at: 0, lo: 0, len: BLOCK / BAY, boundary: true });
         }
-        let roll = self.carve.with_xy(x, y).roll();
-        let gap: Mask = 0b11 << roll.below(3);
-        if roll.chance(ONE / 2) { (north & !gap, east) } else { (north, east & !gap) }
+        let block = block_b;
+        let density = self.block_density(block);
+        let (alx, aly) = (ax & (BLOCK - 1), ay & (BLOCK - 1));
+        let (blx, bly) = (x & (BLOCK - 1), y & (BLOCK - 1));
+        let mut rect = Rect { x0: 0, y0: 0, x1: BLOCK, y1: BLOCK };
+        let mut key = self.block_key(block);
+        while let Some(cut) = self.cut(rect, key, density) {
+            let parts = Self::parts(rect, cut);
+            let index_of = |px: i32, py: i32| {
+                parts.iter().position(|part| part.is_some_and(|p| p.contains(px, py))).expect("covered")
+            };
+            let (ia, ib) = (index_of(alx, aly), index_of(blx, bly));
+            if ia != ib {
+                // This cut separates them. Its line runs the full width of
+                // the space being cut.
+                let at = if ia == 0 { cut.from } else { cut.to };
+                let (lo, len) = if cut.vertical { (rect.y0, rect.bays_deep()) } else { (rect.x0, rect.bays_wide()) };
+                let key = key.with(0x11E + ia as u64);
+                return Some(Line { key, block, vertical: cut.vertical, at, lo, len, boundary: false });
+            }
+            // Both are in the corridor of this cut, which is one room.
+            if parts[2].is_some() && ia == 1 {
+                return None;
+            }
+            rect = parts[ia].expect("index came from this array");
+            key = key.with(ia as u64 + 1);
+        }
+        None
     }
 
-    /// What stands on each of the four cell edges of a segment, given its
-    /// final wall mask. This is where a plain wall piece may turn out to
-    /// have a window or a crawl hole in it.
-    fn dress(&self, axis: Axis, x: i32, y: i32, mask: Mask) -> [Edge; 4] {
-        let mut edges = [Edge::Open; 4];
-        for (b, edge) in edges.iter_mut().enumerate() {
-            if mask >> b & 1 != 0 {
-                *edge = Edge::Wall;
+    /// The rooms on the low and high side of a line, `place` bays along it.
+    fn rooms_beside(&self, line: &Line, place: i32) -> (Room, Room) {
+        let along = line.lo + place * BAY;
+        let (hx, hy) = if line.vertical { (line.at, along) } else { (along, line.at) };
+        let high = line.block.offset(hx, hy);
+        let low = if line.vertical { high.offset(-BAY, 0) } else { high.offset(0, -BAY) };
+        (self.room_at(low.x, low.y), self.room_at(high.x, high.y))
+    }
+
+    /// Whether the wall piece at cell `(x, y)` is the one piece of a secret
+    /// room's wall that has the crawl hole.
+    fn is_secret_entrance(&self, room: &Room, axis: Axis, x: i32, y: i32) -> bool {
+        if room.kind != RoomKind::Secret {
+            return false;
+        }
+        let (w, h) = room.size();
+        let pick = room.key.with(0xC4A).roll().below(2 * (w + h) as u32) as i32;
+        let corner = room.corner();
+        // Pieces are numbered along the south side, the north, the west and
+        // then the east.
+        let (pick_axis, px, py) = if pick < w {
+            (Axis::EastWest, pick * BAY, 0)
+        } else if pick < 2 * w {
+            (Axis::EastWest, (pick - w) * BAY, h * BAY)
+        } else if pick < 2 * w + h {
+            (Axis::NorthSouth, 0, (pick - 2 * w) * BAY)
+        } else {
+            (Axis::NorthSouth, w * BAY, (pick - 2 * w - h) * BAY)
+        };
+        let chosen = corner.offset(px, py);
+        pick_axis == axis && chosen.x == x && chosen.y == y
+    }
+
+    /// The place along a line where its guaranteed doorway goes: a hashed
+    /// place, moved along if it would open into a secret room.
+    fn guaranteed_door(&self, line: &Line) -> Option<i32> {
+        let first = line.key.roll().below(line.len as u32) as i32;
+        (0..line.len).map(|step| (first + step) % line.len).find(|&place| {
+            let (low, high) = self.rooms_beside(line, place);
+            low.kind != RoomKind::Secret && high.kind != RoomKind::Secret
+        })
+    }
+
+    /// What stands on each of the four cell edges of the 2 m wall piece
+    /// whose south or west end is at cell `(x, y)`.
+    fn segment(&self, axis: Axis, x: i32, y: i32) -> [Edge; 4] {
+        const WALL: [Edge; 4] = [Edge::Wall; 4];
+        const OPEN: [Edge; 4] = [Edge::Open; 4];
+        let middle = |edge: Edge| [Edge::Wall, edge, edge, Edge::Wall];
+
+        let Some(line) = self.line_between(axis, x, y) else {
+            return OPEN;
+        };
+        let local = CellPos::new(x, y);
+        let (dx, dy) = line.block.delta_to(local);
+        let place = ((if line.vertical { dy } else { dx }) - line.lo) / BAY;
+        let (low, high) = self.rooms_beside(&line, place);
+
+        // Secret rooms: one crawl hole, otherwise blank wall.
+        if low.kind == RoomKind::Secret || high.kind == RoomKind::Secret {
+            let entrance = self.is_secret_entrance(&low, axis, x, y) || self.is_secret_entrance(&high, axis, x, y);
+            return if entrance { middle(Edge::Crawl) } else { WALL };
+        }
+
+        let here = line.key.with(1 + place as u64).roll();
+        let density = self.block_density(line.block);
+        // Some cuts inside a block are never built, which merges rooms into
+        // L-shapes and open-plan floors.
+        if !line.boundary && line.len >= 2 {
+            let open_plan = lerp(self.p.open_plan[0], self.p.open_plan[1], density);
+            if line.key.with(0).roll().chance(open_plan) {
+                return OPEN;
             }
         }
-        // Only an unbroken piece of wall can carry a feature, and the
-        // feature takes its middle metre. The half-metre of wall left at
-        // each end keeps it clear of any wall meeting this one at a corner.
-        if mask == FULL {
-            let roll = self.feature.with(axis as u64).with_xy(x, y).roll();
-            let feature = match Rarity::of(roll) {
-                Some(Rarity::Common) => Some(Edge::Window),
-                Some(Rarity::Uncommon) => Some(Edge::Crawl),
-                // Rarer tiers are reserved for features still to come.
-                _ => None,
-            };
-            if let Some(feature) = feature {
-                edges[1] = feature;
-                edges[2] = feature;
-            }
+        // A corridor that reaches this wall end-on runs straight through it.
+        let ends_here =
+            |room: &Room| room.kind == if line.vertical { RoomKind::CorridorEast } else { RoomKind::CorridorNorth };
+        if ends_here(&low) || ends_here(&high) {
+            return OPEN;
         }
-        edges
+        // Doorways: the guaranteed one, and the occasional extra. Walls
+        // between blocks get more, so blocks do not feel like islands.
+        let extra = if line.boundary { self.p.extra_door * 2 } else { self.p.extra_door };
+        if self.guaranteed_door(&line) == Some(place) || here.chance(extra) {
+            return if here.next().chance(self.p.wide_door) { OPEN } else { middle(Edge::Open) };
+        }
+        // A plain piece of wall, now and then with a window in it.
+        let feature = self.feature.with(axis as u64).with_xy(x, y).roll();
+        if Rarity::of(feature).is_some() { middle(Edge::Window) } else { WALL }
     }
 
     /// How far the lattice point at cell corner `(x, y)` is out of true.
@@ -309,25 +522,24 @@ impl<'a> Gen<'a> {
         Skew { dx: push(roll), dy: push(roll.next()) }
     }
 
-    /// Whether the cell at `(x, y)` is a pillar. Only cells at a 4 m lattice
-    /// point can be, and only where none of the four segments meeting at that
-    /// point carries any wall: pillars are free-standing.
+    /// Whether the cell at `(x, y)` is a column. Columns stand in halls, on
+    /// every other lattice point that is well inside the room.
     fn pillar_at(&self, x: i32, y: i32) -> bool {
         debug_assert!(x & (PILLAR_PITCH - 1) == 0 && y & (PILLAR_PITCH - 1) == 0);
-        let d = self.density.sample(x, y);
-        if d >= self.p.pillar_until {
+        let room = self.room_at(x, y);
+        let (w, h) = room.size();
+        if room.kind != RoomKind::Room || w < 4 || h < 4 {
             return false;
         }
-        let chance = lerp(self.p.pillar, 0, d * ONE / self.p.pillar_until);
-        if !self.pillar.with_xy(x, y).roll().chance(chance) {
+        // The lattice point must be inside the room, not on its walls: the
+        // bays diagonally across it belong to the same room.
+        let corner = room.corner();
+        let (dx, dy) = corner.delta_to(CellPos::new(x, y));
+        if dx <= 0 || dy <= 0 {
             return false;
         }
-        // The fix-up only ever removes wall from a segment that had some, so
-        // "raw segment is empty" and "final segment is empty" are the same.
-        self.raw_segment(Axis::NorthSouth, x, y) == 0
-            && self.raw_segment(Axis::NorthSouth, x, y.wrapping_sub(BAY)) == 0
-            && self.raw_segment(Axis::EastWest, x, y) == 0
-            && self.raw_segment(Axis::EastWest, x.wrapping_sub(BAY), y) == 0
+        // One decision per hall: it has columns or it does not.
+        room.key.with(0x9111).roll().chance(self.p.pillars)
     }
 
     fn region_lighting(&self, region: RegionPos) -> RegionLighting {
@@ -379,17 +591,6 @@ impl<'a> Gen<'a> {
     }
 }
 
-/// A doorway inside a 2 m segment: 1 m, 1.5 m or the full 2 m wide.
-fn door_mask(roll: crate::hash::Roll) -> Mask {
-    let width = match roll.unit() {
-        u if u < pct(60) => 2,
-        u if u < pct(85) => 3,
-        _ => 4,
-    };
-    let offset = roll.below(5 - width);
-    ((1 << width) - 1) << offset
-}
-
 /// Zero up to `floor`, then a straight rise to (just under) 1.0 at the top of
 /// the noise range. `floor` must be below 65535.
 fn ramp(n: Q16, floor: Q16) -> Q16 {
@@ -406,23 +607,19 @@ pub fn generate(version: GeneratorVersion, params: &Params, level: LevelId, pos:
     let origin = pos.origin();
     let mut chunk = Chunk::empty(version, level, pos);
 
-    // Walls. The bays one step outside the chunk to the west and south own
-    // the segments on the chunk's west and south boundary, so they are
-    // visited too.
-    for j in -1..BAYS {
-        for i in -1..BAYS {
-            let bay = origin.offset(i * BAY, j * BAY);
-            let (north, east) = g.bay_exits(bay.x, bay.y);
-            // The segments are dressed by their own position, not the
-            // bay's, so both chunks sharing a boundary segment agree.
-            let north = g.dress(Axis::EastWest, bay.x, bay.y.wrapping_add(BAY), north);
-            let east = g.dress(Axis::NorthSouth, bay.x.wrapping_add(BAY), bay.y, east);
-            for b in 0..BAY as usize {
-                if i >= 0 {
-                    chunk.south[((j + 1) * BAY) as usize][(i * BAY) as usize + b] = north[b];
-                }
-                if j >= 0 {
-                    chunk.west[(j * BAY) as usize + b][((i + 1) * BAY) as usize] = east[b];
+    // Walls: every 2 m piece on every lattice line of the chunk, including
+    // the far boundary, which the neighbouring chunk computes identically.
+    for j in 0..=BAYS {
+        for i in 0..=BAYS {
+            let at = origin.offset(i * BAY, j * BAY);
+            if i < BAYS {
+                let piece = g.segment(Axis::EastWest, at.x, at.y);
+                chunk.south[(j * BAY) as usize][(i * BAY) as usize..][..4].copy_from_slice(&piece);
+            }
+            if j < BAYS {
+                let piece = g.segment(Axis::NorthSouth, at.x, at.y);
+                for (b, edge) in piece.into_iter().enumerate() {
+                    chunk.west[(j * BAY) as usize + b][(i * BAY) as usize] = edge;
                 }
             }
         }
@@ -495,27 +692,22 @@ pub fn generate(version: GeneratorVersion, params: &Params, level: LevelId, pos:
 
 #[cfg(test)]
 mod tests {
+    // The crate itself is `no_std`; its tests may use the standard library.
+    extern crate std;
+    use std::vec::Vec;
+
     use super::*;
 
-    #[test]
-    fn passable_needs_one_metre() {
-        assert!(passable(0b0000));
-        assert!(passable(0b1100));
-        assert!(passable(0b1001));
-        assert!(!passable(0b1010));
-        assert!(!passable(0b0101));
-        assert!(!passable(0b1111));
-        assert!(!passable(0b1101));
+    fn generator() -> Gen<'static> {
+        Gen::new(&LEVEL_0, LevelId::ZERO)
     }
 
-    #[test]
-    fn doors_are_at_least_one_metre_and_inside_the_segment() {
-        let key = Key::new(5);
-        for i in 0..2000 {
-            let mask = door_mask(key.with(i).roll());
-            assert!(mask != 0 && mask & !FULL == 0, "door {mask:#b} leaves the segment");
-            assert!(passable(FULL & !mask), "door {mask:#b} is too narrow");
-        }
+    /// Bay corners over a few blocks near the origin and across the world
+    /// corner.
+    fn sample_bays() -> impl Iterator<Item = (i32, i32)> {
+        [-256i32, i32::MAX - 255].into_iter().flat_map(|start| {
+            (0..96).flat_map(move |j| (0..96).map(move |i| (start.wrapping_add(i * BAY), start.wrapping_add(j * BAY))))
+        })
     }
 
     #[test]
@@ -527,16 +719,102 @@ mod tests {
     }
 
     #[test]
-    fn every_bay_has_an_exit() {
-        let g = Gen::new(&LEVEL_0, LevelId::ZERO);
-        // Around the origin and across the world corner.
-        for start in [-400i32, i32::MAX - 399] {
-            for j in 0..200 {
-                for i in 0..200 {
-                    let (x, y) = (start.wrapping_add(i * BAY), start.wrapping_add(j * BAY));
-                    let (north, east) = g.bay_exits(x, y);
-                    assert!(passable(north) || passable(east), "bay at {x},{y} is sealed");
+    fn rooms_tile_their_block() {
+        let g = generator();
+        for (x, y) in sample_bays() {
+            let room = g.room_at(x, y);
+            let (w, h) = room.size();
+            assert!(w >= 1 && h >= 1 && w <= 16 && h <= 16);
+            // Every bay of the room reports the same room.
+            let corner = room.corner();
+            let far = corner.offset((w - 1) * BAY, (h - 1) * BAY);
+            assert_eq!(g.room_at(corner.x, corner.y), room);
+            assert_eq!(g.room_at(far.x, far.y), room);
+            // And the bay just past its east side is a different one.
+            let beyond = corner.offset(w * BAY, 0);
+            assert_ne!(g.room_at(beyond.x, beyond.y).key, room.key);
+        }
+    }
+
+    #[test]
+    fn walls_stand_exactly_between_different_rooms() {
+        let g = generator();
+        for (x, y) in sample_bays() {
+            for (axis, lx, ly) in [(Axis::NorthSouth, x.wrapping_sub(BAY), y), (Axis::EastWest, x, y.wrapping_sub(BAY))]
+            {
+                let same_room =
+                    g.room_at(lx, ly).key == g.room_at(x, y).key && Gen::block_of(lx, ly) == Gen::block_of(x, y);
+                let piece = g.segment(axis, x, y);
+                if same_room {
+                    assert_eq!(piece, [Edge::Open; 4], "wall inside a room at {x},{y}");
                 }
+                assert_eq!(g.line_between(axis, x, y).is_none(), same_room);
+            }
+        }
+    }
+
+    #[test]
+    fn every_piece_is_one_of_the_known_shapes() {
+        let g = generator();
+        let w = Edge::Wall;
+        for (x, y) in sample_bays() {
+            for axis in [Axis::NorthSouth, Axis::EastWest] {
+                let piece = g.segment(axis, x, y);
+                let known = [
+                    [Edge::Open; 4],
+                    [w; 4],
+                    [w, Edge::Open, Edge::Open, w],
+                    [w, Edge::Window, Edge::Window, w],
+                    [w, Edge::Crawl, Edge::Crawl, w],
+                ];
+                assert!(known.contains(&piece), "odd piece {piece:?} at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
+    fn secret_rooms_have_one_crawl_hole_and_no_doorway() {
+        let g = generator();
+        let mut secrets = 0;
+        for (x, y) in sample_bays() {
+            let room = g.room_at(x, y);
+            if room.kind != RoomKind::Secret || room.corner() != CellPos::new(x, y) {
+                continue;
+            }
+            secrets += 1;
+            let (w, h) = room.size();
+            let corner = room.corner();
+            let mut pieces = Vec::new();
+            for i in 0..w {
+                pieces.push(g.segment(Axis::EastWest, corner.offset(i * BAY, 0).x, corner.y));
+                pieces.push(g.segment(Axis::EastWest, corner.offset(i * BAY, 0).x, corner.offset(0, h * BAY).y));
+            }
+            for j in 0..h {
+                pieces.push(g.segment(Axis::NorthSouth, corner.x, corner.offset(0, j * BAY).y));
+                pieces.push(g.segment(Axis::NorthSouth, corner.offset(w * BAY, 0).x, corner.offset(0, j * BAY).y));
+            }
+            let holes = pieces.iter().filter(|p| p[1] == Edge::Crawl).count();
+            let open = pieces.iter().filter(|p| p.contains(&Edge::Open)).count();
+            // Two secret rooms side by side may each put their hole in the
+            // shared wall, so "at least one" is the rule.
+            assert!(holes >= 1, "secret room at {x},{y} has no way in");
+            assert_eq!(open, 0, "secret room at {x},{y} has a doorway");
+        }
+        assert!(secrets >= 3, "only {secrets} secret rooms in the sample");
+    }
+
+    #[test]
+    fn every_wall_line_has_a_doorway_unless_it_only_borders_secrets() {
+        let g = generator();
+        for (x, y) in sample_bays() {
+            for axis in [Axis::NorthSouth, Axis::EastWest] {
+                let Some(line) = g.line_between(axis, x, y) else { continue };
+                let Some(place) = g.guaranteed_door(&line) else { continue };
+                let along = line.lo + place * BAY;
+                let at =
+                    if line.vertical { line.block.offset(line.at, along) } else { line.block.offset(along, line.at) };
+                let piece = g.segment(axis, at.x, at.y);
+                assert!(piece[1] == Edge::Open, "no doorway at the guaranteed place {at:?}: {piece:?}");
             }
         }
     }

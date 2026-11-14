@@ -139,7 +139,7 @@ fn wallpaper(along_cell: i32, along_f: f32, across: i32, height: f32, damp_in: f
     color = color * mix(1.0, 0.55, wet);
 
     // Where wear is heavy the paper has come away from the plaster.
-    let peel = smoothstep(0.68, 0.74, wear_in * 0.45 + cloud(wall_cell, wall_f, salt + 4u) * 0.5);
+    let peel = smoothstep(0.68, 0.74, wear_in * 0.36 + cloud(wall_cell, wall_f, salt + 4u) * 0.5);
     color = mix(color, vec3<f32>(0.42, 0.39, 0.31) * (0.9 + 0.2 * grime), peel);
 
     // Skirting board.

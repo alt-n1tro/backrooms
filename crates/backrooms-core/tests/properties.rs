@@ -168,9 +168,10 @@ fn features_sit_in_the_middle_of_whole_wall_pieces() {
             }
         }
     });
-    // Windows are common, crawl holes about eight times rarer.
+    // Windows are common; crawl holes exist only at secret rooms and are
+    // far rarer.
     assert!(windows > 300, "{windows} windows");
-    assert!(crawls > 30 && crawls * 3 < windows, "{crawls} crawl holes against {windows} windows");
+    assert!(crawls >= 5 && crawls * 5 < windows, "{crawls} crawl holes against {windows} windows");
 }
 
 /// Lattice points on a chunk boundary belong to both chunks, which must
@@ -199,6 +200,13 @@ fn skew_is_shared_bounded_and_mostly_absent() {
 /// Flood-fills a `side` x `side` block of chunks and returns
 /// `(cells in the largest connected area, walkable cells)`.
 fn largest_area(south_west: ChunkPos, side: usize) -> (usize, usize) {
+    let areas = areas(south_west, side, false);
+    (areas.iter().copied().max().unwrap_or(0), areas.iter().sum())
+}
+
+/// Sizes of the connected areas of a block of chunks, for a player who can
+/// (`crawling`) or cannot use crawl holes.
+fn areas(south_west: ChunkPos, side: usize, crawling: bool) -> Vec<usize> {
     let chunks: Vec<Chunk> =
         (0..side * side).map(|i| chunk(south_west.offset((i % side) as i32, (i / side) as i32))).collect();
     let width = side * N;
@@ -208,8 +216,17 @@ fn largest_area(south_west: ChunkPos, side: usize) -> (usize, usize) {
         !c.cells[ly][lx].solid
     };
 
+    let passable = |c: &Chunk, lx: usize, ly: usize, dir: Dir| {
+        let edge = match dir {
+            Dir::West => c.west[ly][lx],
+            Dir::East => c.west[ly][lx + 1],
+            Dir::South => c.south[ly][lx],
+            Dir::North => c.south[ly + 1][lx],
+        };
+        edge == Edge::Open || (crawling && edge == Edge::Crawl)
+    };
     let mut seen = vec![false; width * width];
-    let (mut largest, mut total) = (0, 0);
+    let mut found = Vec::new();
     let mut queue = VecDeque::new();
     for start in 0..width * width {
         let (sx, sy) = (start % width, start / width);
@@ -229,16 +246,34 @@ fn largest_area(south_west: ChunkPos, side: usize) -> (usize, usize) {
                 (Dir::South, y > 0, x, y.wrapping_sub(1)),
             ];
             for (dir, inside, nx, ny) in steps {
-                if inside && c.open_towards(lx, ly, dir) && !seen[ny * width + nx] {
+                if inside && passable(c, lx, ly, dir) && !seen[ny * width + nx] {
                     seen[ny * width + nx] = true;
                     queue.push_back((nx, ny));
                 }
             }
         }
-        total += area;
-        largest = largest.max(area);
+        found.push(area);
     }
-    (largest, total)
+    found
+}
+
+/// Crawl holes lead only to places that cannot be walked to: on foot the
+/// level falls into one big area plus sealed pockets, and crawling joins
+/// the pockets to it.
+#[test]
+fn crawl_holes_lead_only_to_rooms_walking_cannot_reach() {
+    let corner = ChunkPos::new(-24, -24);
+    let mut walking = areas(corner, 48, false);
+    let mut crawling = areas(corner, 48, true);
+    walking.sort_unstable_by(|a, b| b.cmp(a));
+    crawling.sort_unstable_by(|a, b| b.cmp(a));
+    let pockets = walking.len() - 1;
+    assert!(pockets >= 3, "only {pockets} secret rooms in 384 m square");
+    // Each pocket is a small room, not a lost wing of the building.
+    assert!(walking[1..].iter().all(|&cells| cells <= 6 * 16), "walking areas: {:?}", &walking[..walking.len().min(8)]);
+    // Crawling reaches (nearly) all of them. A secret room on the edge of
+    // the sample may have its hole on the far side.
+    assert!(crawling.len() <= 1 + pockets / 3, "{} areas even when crawling, {pockets} pockets", crawling.len());
 }
 
 /// The level is one connected space. Inside a finite window a few pockets
@@ -249,7 +284,7 @@ fn the_level_is_connected() {
     for south_west in [ChunkPos::new(-24, -24), ChunkPos::new(ChunkPos::MAX - 23, ChunkPos::MAX - 23)] {
         let (largest, total) = largest_area(south_west, 48);
         let per_mille = largest * 1000 / total;
-        assert!(per_mille >= 995, "only {per_mille} per mille of the floor around {south_west:?} is connected");
+        assert!(per_mille >= 990, "only {per_mille} per mille of the floor around {south_west:?} is connected");
     }
 }
 
@@ -270,7 +305,7 @@ fn the_level_has_variety() {
             }
         }
     });
-    assert!(walls * 100 / edges >= 3 && walls * 100 / edges <= 20, "{walls} walls on {edges} edges");
+    assert!(walls * 100 / edges >= 3 && walls * 100 / edges <= 25, "{walls} walls on {edges} edges");
     assert!(pillars > 50, "{pillars} pillars");
     assert!(on > dead && on > flicker && dead > 20 && flicker > 20, "lights: {on} on, {dead} dead, {flicker} flicker");
     assert!(damp > 1000, "{damp} damp cells");

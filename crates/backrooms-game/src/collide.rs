@@ -14,7 +14,7 @@ use crate::space::{CELL, Plan, WALL_HALF, blocks};
 /// step clean through a wall between two checks.
 const MAX_STEP: f32 = 0.1;
 
-/// The player's body for collision: a circle on the plan, with a height.
+/// The player's body for collision: a circle on the floor, with a height.
 /// The height decides what counts as an obstacle: a crawl hole stops a
 /// standing body and lets a crawling one through.
 #[derive(Clone, Copy, Debug)]
@@ -26,7 +26,10 @@ pub struct Body {
 }
 
 /// Moves `body` from `from` by `delta`, sliding along obstacles. Positions
-/// are plan coordinates relative to the plan's base.
+/// are real positions in metres relative to the plan's base: where things
+/// are drawn, skew included. The player never has to be converted to some
+/// other space, so being near a skewed wall changes nothing about how they
+/// move.
 pub fn slide(plan: &impl Plan, from: Vec2, delta: Vec2, body: Body) -> Vec2 {
     let steps = (delta.length() / MAX_STEP).ceil().max(1.0) as u32;
     let step = delta / steps as f32;
@@ -35,75 +38,68 @@ pub fn slide(plan: &impl Plan, from: Vec2, delta: Vec2, body: Body) -> Vec2 {
         pos += step;
         // Being pushed out of one wall can push the circle into another (in
         // a corner), so resolve a few times.
-        for _ in 0..3 {
-            pos = push_out(plan, pos, body);
+        for _ in 0..4 {
+            match deepest_overlap(plan, pos, body) {
+                Some(push) => pos += push,
+                None => break,
+            }
         }
     }
     pos
 }
 
-/// Pushes the circle out of every obstacle near it, once.
-fn push_out(plan: &impl Plan, mut pos: Vec2, body: Body) -> Vec2 {
-    let radius = body.radius;
+/// Where a point of the plan (in cells) really is, in metres.
+fn real(plan: &impl Plan, x: i32, y: i32) -> Vec2 {
+    let at = Vec2::new(x as f32, y as f32);
+    at * CELL + plan.warp(at)
+}
+
+/// The move that takes the circle out of whichever obstacle it is deepest
+/// inside, or `None` if it touches nothing.
+///
+/// A wall is a row of half-metre pieces. Resolving the *deepest* overlap
+/// first matters: sliding along a wall, the circle overlaps the piece beside
+/// it squarely and the next piece's end only slightly. Dealing with the
+/// square one first pushes it straight out and clears both; starting with
+/// the other would shove it sideways along the wall.
+fn deepest_overlap(plan: &impl Plan, pos: Vec2, body: Body) -> Option<Vec2> {
     let solid_ns = |x: i32, y: i32| blocks(plan.slab_ns(x, y), body.height, body.ceiling);
     let solid_ew = |x: i32, y: i32| blocks(plan.slab_ew(x, y), body.height, body.ceiling);
     let cell = (pos / CELL).floor();
     let (cx, cy) = (cell.x as i32, cell.y as i32);
-    // Anything further than one cell away cannot touch a circle smaller than
-    // a cell.
-    for y in cy - 1..=cy + 2 {
-        for x in cx - 1..=cx + 2 {
-            let corner = Vec2::new(x as f32, y as f32) * CELL;
-            // A wall is stored as a row of half-metre pieces. If each piece
-            // were its own box, a circle sliding along the wall would catch
-            // on the corners where two pieces meet and be shoved sideways.
-            // So where the wall carries on, the box is stretched a whole
-            // cell that way: the circle then always meets a flat face. Where
-            // the wall ends, the box gets the same half-thickness cap as the
-            // drawn wall.
-            let reach = |continues: bool| if continues { CELL } else { WALL_HALF };
+    let mut best: Option<(f32, Vec2)> = None;
+    // Offers one obstacle: a line from `a` to `b`, `half` thick each side.
+    let mut offer = |a: Vec2, b: Vec2, half: f32| {
+        let along = b - a;
+        let t = ((pos - a).dot(along) / along.length_squared()).clamp(0.0, 1.0);
+        let away = pos - (a + along * t);
+        let distance = away.length();
+        let depth = body.radius + half - distance;
+        if depth > 0.0 && best.is_none_or(|(deepest, _)| depth > deepest) {
+            // Dead centre on the line there is no "away"; leave sideways.
+            let direction = if distance > 1e-6 { away / distance } else { along.perp().normalize() };
+            best = Some((depth, direction * depth));
+        }
+    };
+    // Skew moves things by less than a cell, so two cells either way covers
+    // everything a circle smaller than a cell could touch.
+    for y in cy - 2..=cy + 2 {
+        for x in cx - 2..=cx + 2 {
             if solid_ns(x, y) {
-                let min = corner - Vec2::new(WALL_HALF, reach(solid_ns(x, y - 1)));
-                let max = corner + Vec2::new(WALL_HALF, CELL + reach(solid_ns(x, y + 1)));
-                pos = push_out_of_box(pos, radius, min, max);
+                offer(real(plan, x, y), real(plan, x, y + 1), WALL_HALF);
             }
             if solid_ew(x, y) {
-                let min = corner - Vec2::new(reach(solid_ew(x - 1, y)), WALL_HALF);
-                let max = corner + Vec2::new(CELL + reach(solid_ew(x + 1, y)), WALL_HALF);
-                pos = push_out_of_box(pos, radius, min, max);
+                offer(real(plan, x, y), real(plan, x + 1, y), WALL_HALF);
             }
             if plan.solid(x, y) {
-                pos = push_out_of_box(pos, radius, corner, corner + Vec2::splat(CELL));
+                let corners = [real(plan, x, y), real(plan, x + 1, y), real(plan, x + 1, y + 1), real(plan, x, y + 1)];
+                for i in 0..4 {
+                    offer(corners[i], corners[(i + 1) % 4], 0.0);
+                }
             }
         }
     }
-    pos
-}
-
-/// If the circle overlaps the box `min..max`, moves it the shortest way out.
-fn push_out_of_box(pos: Vec2, radius: f32, min: Vec2, max: Vec2) -> Vec2 {
-    let nearest = pos.clamp(min, max);
-    let away = pos - nearest;
-    let distance = away.length();
-    if distance >= radius {
-        return pos;
-    }
-    if distance > 1e-6 {
-        return nearest + away / distance * radius;
-    }
-    // The centre is inside the box: leave through the nearest side.
-    let to_min = pos - min;
-    let to_max = max - pos;
-    let nearest_side = to_min.x.min(to_max.x).min(to_min.y).min(to_max.y);
-    if nearest_side == to_min.x {
-        Vec2::new(min.x - radius, pos.y)
-    } else if nearest_side == to_max.x {
-        Vec2::new(max.x + radius, pos.y)
-    } else if nearest_side == to_min.y {
-        Vec2::new(pos.x, min.y - radius)
-    } else {
-        Vec2::new(pos.x, max.y + radius)
-    }
+    best.map(|(_, push)| push)
 }
 
 #[cfg(test)]
@@ -263,6 +259,43 @@ pub mod tests {
             let end = slide(&plan, Vec2::new(1.0, 0.5), Vec2::new(2.0, 0.0), Body { height, ..R });
             assert!(end.x < 2.0, "a body {height} m tall went through a window");
         }
+    }
+
+    #[test]
+    fn a_skewed_wall_is_solid_where_it_is_drawn() {
+        // A wall on x = 4 from y = 4 to y = 8, with its south end (the
+        // lattice point 4,4) pushed 0.25 m east. It now slants.
+        let plan = TestPlan {
+            west: (4..8).map(|y| (4, y)).collect(),
+            skews: vec![((4, 4), Vec2::new(0.25, 0.0))],
+            ..Default::default()
+        };
+        // Walk east into it at several places. Wherever you end up, you
+        // are touching the wall as drawn: the slanted line from (2.25, 2)
+        // to (2, 4), not the straight one the plan has.
+        let (a, b) = (Vec2::new(2.25, 2.0), Vec2::new(2.0, 4.0));
+        for north in [2.2, 2.8, 3.4] {
+            let end = slide(&plan, Vec2::new(1.0, north), Vec2::new(3.0, 0.0), R);
+            let along = b - a;
+            let t = ((end - a).dot(along) / along.length_squared()).clamp(0.0, 1.0);
+            let gap = end.distance(a + along * t);
+            assert!((gap - (WALL_HALF + RADIUS)).abs() < 0.01, "from north {north}: {gap} m from the wall at {end}");
+            assert!(end.x < 2.25, "went through at {end}");
+        }
+    }
+
+    #[test]
+    fn standing_still_near_skew_does_not_move_you() {
+        let plan = TestPlan {
+            west: (4..8).map(|y| (4, y)).collect(),
+            skews: vec![((4, 4), Vec2::new(0.25, 0.1)), ((4, 8), Vec2::new(-0.2, 0.15))],
+            ..Default::default()
+        };
+        let mut pos = Vec2::new(1.4, 2.7);
+        for _ in 0..600 {
+            pos = slide(&plan, pos, Vec2::ZERO, R);
+        }
+        assert_eq!(pos, Vec2::new(1.4, 2.7));
     }
 
     #[test]

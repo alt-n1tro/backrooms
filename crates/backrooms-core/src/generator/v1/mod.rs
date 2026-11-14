@@ -26,7 +26,7 @@ pub mod purpose {
     pub const Z_SHUFFLE: u64 = 1;
     pub const DENSITY: u64 = 2;
     pub const WALL: u64 = 3;
-    pub const CARVE: u64 = 4;
+    pub const CARVE: u64 = 4; // retired, never reuse
     pub const PILLAR: u64 = 5;
     pub const FIXTURE: u64 = 6;
     pub const POWER: u64 = 7;

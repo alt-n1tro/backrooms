@@ -4,6 +4,33 @@ Every delivery gets a version (MAJOR.MINOR.PATCH), however small the change.
 "Generator" lines say whether the world itself changed: once generator v1
 ships, any such change will require a new generator version instead.
 
+## 0.5.0 — Rooms
+
+World (generator v1 changed; golden hashes re-blessed):
+
+- Level 0 is now laid out as rooms instead of independently hashed walls.
+  Each 32 m block is divided the way a floor plan is: cut in two, then
+  again, until the parts are room-sized, often leaving a 2 m corridor
+  between the two sides of a cut. The result is offices off corridors,
+  closets, and open halls with regular grids of columns.
+- Every cut gets at least one doorway, as does every wall between blocks,
+  so the level is connected by construction rather than by statistics.
+- Secret rooms: a rare small room has no doorway, only one crawl hole.
+  Crawl holes no longer appear anywhere else, so each one leads somewhere
+  that cannot be walked into.
+- Some cuts are left unbuilt, merging rooms into L-shapes and open-plan
+  floors; corridors run straight through the walls they end at.
+- Density now varies per block over 128 m zones.
+
+Game:
+
+- Fixed: the player wobbled and drifted near skewed walls. Collision now
+  works directly against the walls as drawn, so nothing about the player
+  changes near skew. Standing still is bit-for-bit still.
+- Crouch also on Ctrl, crawl also on Z. Walking into a crawl hole while
+  crouched drops to a crawl automatically.
+- Less wallpaper peeling in heavily worn areas.
+
 ## 0.4.0 — Milestone 4a: Level 0 anomalies
 
 Milestone 4 is delivered in three steps. This is the first; portals (4b) and
