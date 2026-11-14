@@ -4,7 +4,7 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.3.0** (milestone 3 of 9: performance pass). See
+Current version: **0.3.1** (milestone 3 of 9: performance pass). See
 [CHANGELOG.md](CHANGELOG.md).
 
 ![Level 0 at the origin](docs/level0-walk.png)
@@ -41,8 +41,8 @@ take seconds.
 | W A S D or arrows | Walk |
 | W twice, then hold (or Shift) | Sprint |
 | Space | Jump |
-| F11 | Fullscreen |
-| F3 | Show frame rate and render size |
+| F11 or F | Fullscreen |
+| F3 or ` (left of 1) | Show frame rate, render size and version |
 | Escape | Release the mouse |
 
 Where to start:

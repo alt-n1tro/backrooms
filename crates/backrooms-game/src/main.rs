@@ -31,8 +31,8 @@ use space::{CELL, ChunkCache, RenderOrigin};
 /// Explore the Backrooms.
 ///
 /// Click to look around. W A S D to walk; tap W twice (or hold Shift) to
-/// sprint; Space to jump. F11 for fullscreen, F3 for frame rate, Escape to
-/// free the mouse.
+/// sprint; Space to jump. F11 for fullscreen, F3 or ` for frame rate, Escape
+/// to free the mouse.
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -217,10 +217,12 @@ fn main() -> ExitCode {
         yaw: args.yaw,
         pitch: args.pitch,
     };
-    println!("Starting at {}", Address { cell: start, ..address });
+    println!("Backrooms {} starting at {}", env!("CARGO_PKG_VERSION"), Address { cell: start, ..address });
 
     let window = Window {
-        title: "Backrooms".into(),
+        // The version is in the title bar so it is obvious at a glance which
+        // build is running.
+        title: concat!("Backrooms ", env!("CARGO_PKG_VERSION")).into(),
         resolution: WindowResolution::new(args.size.0, args.size.1),
         // Without vsync a finished frame is shown at once instead of being
         // queued for the display's next refresh, which takes a frame or two

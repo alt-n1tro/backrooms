@@ -4,6 +4,14 @@ Every delivery gets a version (MAJOR.MINOR.PATCH), however small the change.
 "Generator" lines say whether the world itself changed: once generator v1
 ships, any such change will require a new generator version instead.
 
+## 0.3.1
+
+- The running version is shown in the window title, printed at start-up and
+  included in the F3 line, so a stale build is obvious.
+- F3 and F11 have second keys, ` (left of 1) and F, for laptops whose F-keys
+  need Fn held.
+- Generator: unchanged.
+
 ## 0.3.0 — Milestone 3: performance pass
 
 Performance:

@@ -98,9 +98,10 @@ fn fit_to_window(
     }
 }
 
-/// F11 switches between a window and the whole screen.
+/// F11 (or F, for laptops whose F-keys need Fn) switches between a window
+/// and the whole screen.
 fn toggle_fullscreen(keys: Res<ButtonInput<KeyCode>>, mut window: Single<&mut Window, With<PrimaryWindow>>) {
-    if keys.just_pressed(KeyCode::F11) {
+    if keys.any_just_pressed([KeyCode::F11, KeyCode::KeyF]) {
         window.mode = match window.mode {
             WindowMode::Windowed => WindowMode::BorderlessFullscreen(MonitorSelection::Current),
             _ => WindowMode::Windowed,

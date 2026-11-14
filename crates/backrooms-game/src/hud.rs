@@ -53,7 +53,13 @@ fn setup(mut commands: Commands) {
 pub fn stats(frame_seconds: f32, picture: UVec2, window: UVec2) -> String {
     let fps = if frame_seconds > 0.0 { (1.0 / frame_seconds).round() } else { 0.0 };
     let percent = (picture.x as f32 / window.x.max(1) as f32 * 100.0).round();
-    format!("{fps} fps | {:.1} ms | drawn at {} x {} ({percent}%)", frame_seconds * 1000.0, picture.x, picture.y)
+    format!(
+        "{fps} fps | {:.1} ms | drawn at {} x {} ({percent}%) | {}",
+        frame_seconds * 1000.0,
+        picture.x,
+        picture.y,
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// What the HUD remembers between frames. `Local<T>` gives a system private
@@ -83,7 +89,9 @@ fn update(
     mut text: Single<&mut Text, With<Readout>>,
     mut state: Local<StatsState>,
 ) {
-    if keys.just_pressed(KeyCode::F3) {
+    // Many laptops need Fn held for the F-keys, so the key left of 1 works
+    // as well.
+    if keys.any_just_pressed([KeyCode::F3, KeyCode::Backquote]) {
         state.visible = !state.visible;
     }
     let dt = time.delta_secs();
@@ -121,7 +129,7 @@ mod tests {
     #[test]
     fn stats_line_reads_naturally() {
         let line = stats(1.0 / 60.0, UVec2::new(1832, 1145), UVec2::new(2880, 1800));
-        assert_eq!(line, "60 fps | 16.7 ms | drawn at 1832 x 1145 (64%)");
+        assert_eq!(line, concat!("60 fps | 16.7 ms | drawn at 1832 x 1145 (64%) | ", env!("CARGO_PKG_VERSION")));
         // Before the first frame there is nothing to divide by.
         assert!(stats(0.0, UVec2::ONE, UVec2::ZERO).starts_with("0 fps"));
     }
