@@ -4,6 +4,11 @@ Every delivery gets a version (MAJOR.MINOR.PATCH), however small the change.
 "Generator" lines say whether the world itself changed: once generator v1
 ships, any such change will require a new generator version instead.
 
+## 0.6.1
+
+- `backrooms find noclip` says which level each wall leads to.
+- Generator: unchanged.
+
 ## 0.6.0 — Levels, portals, noclip, stairs
 
 World (generator v1 changed; golden hashes re-blessed):

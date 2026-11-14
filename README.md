@@ -4,7 +4,7 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.6.0** (68 levels, portals, noclip and stairs). See
+Current version: **0.6.1** (68 levels, portals, noclip and stairs). See
 [CHANGELOG.md](CHANGELOG.md).
 
 ![The warehouse, level 64](docs/level0-walk.png)

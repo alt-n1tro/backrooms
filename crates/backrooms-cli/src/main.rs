@@ -95,6 +95,8 @@ enum Oddity {
 struct Sighting {
     stand: CellPos,
     yaw: i32,
+    /// The cell the feature itself is on, for looking up where it leads.
+    piece: CellPos,
 }
 
 /// The oddities in one chunk.
@@ -116,7 +118,7 @@ fn sightings(chunk: &Chunk, what: Oddity, found: &mut Vec<Sighting>) {
                     Dir::South => 0,
                     Dir::West => -90,
                 };
-                found.push(Sighting { stand, yaw });
+                found.push(Sighting { stand, yaw, piece: stand });
             }
             return;
         }
@@ -125,7 +127,10 @@ fn sightings(chunk: &Chunk, what: Oddity, found: &mut Vec<Sighting>) {
             for (j, row) in chunk.skew.iter().enumerate().take(4) {
                 for (i, skew) in row.iter().enumerate().take(4) {
                     if skew.dx.unsigned_abs().max(skew.dy.unsigned_abs()) >= 15 {
-                        found.push(Sighting { stand: origin.offset(i as i32 * 4 + 1, j as i32 * 4 + 1), yaw: 0 });
+                        {
+                            let stand = origin.offset(i as i32 * 4 + 1, j as i32 * 4 + 1);
+                            found.push(Sighting { stand, yaw: 0, piece: stand });
+                        }
                     }
                 }
             }
@@ -140,11 +145,11 @@ fn sightings(chunk: &Chunk, what: Oddity, found: &mut Vec<Sighting>) {
             let here = origin.offset(x as i32, y as i32);
             if y % 4 == 1 && chunk.west[y][x] == wanted {
                 // The wall runs north; stand a metre west of it, facing east.
-                found.push(Sighting { stand: here.offset(-2, 0), yaw: -90 });
+                found.push(Sighting { stand: here.offset(-2, 0), yaw: -90, piece: here });
             }
             if x % 4 == 1 && chunk.south[y][x] == wanted {
                 // The wall runs east; stand a metre south of it, facing north.
-                found.push(Sighting { stand: here.offset(0, -2), yaw: 0 });
+                found.push(Sighting { stand: here.offset(0, -2), yaw: 0, piece: here });
             }
         }
     }
@@ -276,9 +281,16 @@ fn run(cli: Cli) -> Result<(), String> {
                 let (dx, dy) = address.cell.delta_to(sighting.stand);
                 // Half a metre per cell.
                 let metres = ((dx as f64).hypot(dy as f64) / 2.0).round();
+                // For a wall that is not there, say which level it leads to.
+                let leads_to = if what == Oddity::Noclip {
+                    let (level, _) = backrooms_core::noclip_exit(address.version, address.level, sighting.piece);
+                    format!("  (leads to LEVEL {})", level_info(address.version, level).name)
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     out,
-                    "{metres:>5} m away: --address {} --yaw {}",
+                    "{metres:>5} m away: --address {} --yaw {}{leads_to}",
                     Address { cell: sighting.stand, ..address },
                     sighting.yaw
                 );
