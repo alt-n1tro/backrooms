@@ -28,9 +28,7 @@ pub(crate) const fn shuffle(key: Key) -> [u8; LEVEL_COUNT] {
     let mut i = LEVEL_COUNT - 1;
     while i > 0 {
         let j = key.with(i as u64).roll().below(i as u32 + 1) as usize;
-        let tmp = order[i];
-        order[i] = order[j];
-        order[j] = tmp;
+        order.swap(i, j);
         i -= 1;
     }
     order

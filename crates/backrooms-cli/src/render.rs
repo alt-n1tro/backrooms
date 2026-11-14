@@ -11,6 +11,10 @@ use backrooms_core::{Chunk, Edge, LightState};
 /// #  wall or pillar        o  light, on
 /// ~  light, flickering     x  light, dead
 /// ```
+// The loops below use `x` both as an array index and as a corner number that
+// runs one past the last cell, which the iterator form clippy suggests
+// cannot express.
+#[allow(clippy::needless_range_loop)]
 pub fn ascii(chunk: &Chunk) -> String {
     let wall = |edge: Edge| edge == Edge::Wall;
     // A corner post is drawn wherever any wall touches the corner.

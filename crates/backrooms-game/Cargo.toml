@@ -1,0 +1,50 @@
+[package]
+name = "backrooms-game"
+description = "First-person explorer for the deterministic Backrooms"
+version.workspace = true
+edition.workspace = true
+# Bevy needs a newer compiler than the core does.
+rust-version = "1.97.1"
+
+[dependencies]
+backrooms-core = { path = "../backrooms-core" }
+clap = { version = "4", features = ["derive"] }
+getrandom = "0.4"
+# Only the parts of Bevy the game uses: this roughly halves the build.
+bevy = { version = "0.20", default-features = false, features = [
+    "std",
+    "async_executor",
+    "multi_threaded",
+    "reflect_auto_register",
+    "bevy_asset",
+    "bevy_log",
+    "bevy_window",
+    "bevy_winit",
+    "x11",
+    "wayland",
+    "keyboard",
+    "mouse",
+    "bevy_color",
+    "bevy_image",
+    "bevy_mesh",
+    "bevy_camera",
+    "bevy_shader",
+    "bevy_material",
+    "bevy_light",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_post_process",
+    "bevy_anti_alias",
+    "area_light_luts",
+    "dfg_lut",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd_rust",
+    "png",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+    "default_font",
+    "bevy_audio",
+] }

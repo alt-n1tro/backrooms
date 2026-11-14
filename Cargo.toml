@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/backrooms-core", "crates/backrooms-cli"]
+members = ["crates/backrooms-core", "crates/backrooms-cli", "crates/backrooms-game"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 
@@ -17,3 +17,12 @@ overflow-checks = true
 # Tests generate a few thousand chunks; unoptimised that is needlessly slow.
 [profile.dev.package.backrooms-core]
 opt-level = 2
+
+# The game is unplayably slow with unoptimised dependencies, and Bevy itself
+# takes minutes to build. Optimising dependencies fully and our own code
+# lightly gives fast frames with quick rebuilds of the game crate.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.backrooms-game]
+opt-level = 1
