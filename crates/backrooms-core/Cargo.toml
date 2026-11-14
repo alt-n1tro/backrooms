@@ -1,0 +1,17 @@
+[package]
+name = "backrooms-core"
+description = "Deterministic, engine-agnostic world generator for the Backrooms explorer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# Deliberately no dependencies: the world function must not change because a
+# third-party crate changed.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+float_arithmetic = "deny"
+float_cmp = "deny"

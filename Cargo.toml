@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/backrooms-core", "crates/backrooms-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+# The core must behave identically in debug and release. Rust panics on integer
+# overflow in debug builds but silently wraps in release, which would be a
+# determinism hazard, so the core keeps the checks on everywhere. Every
+# intentional wrap in the core is written explicitly (`wrapping_add`, ...).
+[profile.release.package.backrooms-core]
+overflow-checks = true
+
+# Tests generate a few thousand chunks; unoptimised that is needlessly slow.
+[profile.dev.package.backrooms-core]
+opt-level = 2

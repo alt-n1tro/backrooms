@@ -1,0 +1,17 @@
+[package]
+name = "backrooms-cli"
+description = "Headless inspection tool for the Backrooms world generator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "backrooms"
+path = "src/main.rs"
+
+[dependencies]
+backrooms-core = { path = "../backrooms-core" }
+clap = { version = "4", features = ["derive"] }
+indicatif = { version = "0.17", features = ["rayon"] }
+png = "0.17"
+rayon = "1"

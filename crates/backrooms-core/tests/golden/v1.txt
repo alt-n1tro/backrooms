@@ -1,0 +1,37 @@
+# Golden hashes for generator v1. One line per chunk or block.
+# Regenerate with: BACKROOMS_BLESS=1 cargo test -p backrooms-core --test golden
+v1 level 0 chunk 0 0 1093fb8b79f2fffe
+v1 level 0 chunk 1 0 18bdc6a0d9a36845
+v1 level 0 chunk 0 1 1daab5ac7f2255eb
+v1 level 0 chunk -1 0 54c65758744e0ab9
+v1 level 0 chunk 0 -1 1367c35f28db510f
+v1 level 0 chunk -1 -1 3c900e5216c3eaa0
+v1 level 0 chunk -134217728 -134217728 47299593fdbb077e
+v1 level 0 chunk 134217727 134217727 1b571ca984f52d96
+v1 level 0 chunk -134217728 134217727 a71c984e72e49dfd
+v1 level 0 chunk 134217727 -134217728 8fd1b3bc40316e7d
+v1 level 0 chunk -134217728 0 6a9b372494648064
+v1 level 0 chunk 134217727 0 eb407558d5d8449d
+v1 level 0 chunk 0 -134217728 3bde21506b8e3f70
+v1 level 0 chunk 0 134217727 58d35ba8a17e6119
+v1 level 0 chunk 31 31 56d8b9d431a93bb9
+v1 level 0 chunk 32 32 21ff1f0d599a1a9d
+v1 level 0 chunk -32 31 14daff3d296ae21b
+v1 level 0 chunk 1000 -1000 d19b0c92ca6a9a79
+v1 level 0 chunk 65535 65536 9ee7437da63ee555
+v1 level 0 chunk -65536 65535 a9b7008cb644aef5
+v1 level 0 chunk 1234567 -7654321 30f4131668527e94
+v1 level 0 chunk -9999999 9999999 5324a505292e8bb2
+v1 level 0 chunk 48271 16807 bfb496c706ede6ea
+v1 level 0 chunk 100000000 100000000 62896c592f1fd464
+v1 level 0 chunk -100000000 100000000 4bd8eba953e95cf3
+v1 level 0 chunk 134217000 -134217000 c6155f5f82f7145b
+v1 level 0 chunk 77777777 -33333333 2d35c39caadc02ca
+v1 level 0 chunk -2 134217727 5d4d3b9f64a91ff4
+v1 level 0 chunk 3 -134217728 aca8a8323054d116
+v1 level 0 chunk 8388607 8388608 0f9ae81d468db4e5
+v1 level 0 chunk -8388609 -8388608 14d932070d634643
+v1 level 0 chunk 20011 -40009 2d7aae366f782553
+v1 level 0 block -24 -24 48 431d1e16c0458f3b
+v1 level 0 block 134217704 134217704 48 e74362ee6ec6129d
+v1 level 0 block 40000000 -90000000 48 0563839ccdc1ce22
