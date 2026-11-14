@@ -13,10 +13,13 @@ use bevy::post_process::bloom::Bloom;
 use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, CursorOptions};
 
-use crate::collide::{Body, slide};
+use backrooms_core::{Edge, level_info, noclip_exit, portal_partner, stair_exit};
+
+use crate::collide::{Body, crossed, slide};
 use crate::screen::Screen;
-use crate::space::{ChunkCache, LocalPlan, RenderOrigin, plan_to_world, world_to_plan};
-use crate::world::{Anchored, Ceiling, ViewDistance};
+use crate::space::{CELL, ChunkCache, LocalPlan, Plan, RenderOrigin, plan_to_world, world_to_plan};
+use crate::surface::haze;
+use crate::world::{Anchored, Ceiling, Travel, Trip, ViewDistance};
 
 const RADIUS: f32 = 0.22;
 const WALK_SPEED: f32 = 1.7;
@@ -36,8 +39,9 @@ const FOV: f32 = 74.0;
 /// for speed.
 const SPRINT_FOV: f32 = 6.0;
 
-/// The haze that distance fades into: the yellow of far-off lit wallpaper.
-const HAZE: Color = Color::srgb(0.20, 0.16, 0.05);
+/// How far into a stairwell (in metres) the player goes before arriving on
+/// the other level.
+const STAIR_COMMIT: f32 = 1.0;
 
 /// How the player is holding themselves.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -114,6 +118,8 @@ pub struct Player {
     wanted: Posture,
     /// Where the eyes are now, easing towards the posture's eye height.
     eye: f32,
+    /// How far the steps of a stairwell have raised or lowered the player.
+    lift: f32,
 }
 
 /// Where the player starts and which way they face.
@@ -136,6 +142,13 @@ pub struct MouseSensitivity(pub f32);
 #[derive(Resource, Default)]
 pub struct Surroundings(Option<LocalPlan>);
 
+impl Surroundings {
+    /// Drops the snapshot, for when the player has been moved elsewhere.
+    pub fn forget(&mut self) {
+        self.0 = None;
+    }
+}
+
 pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
@@ -146,8 +159,15 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn setup(mut commands: Commands, spawn: Res<Spawn>, view: Res<ViewDistance>, screen: Res<Screen>) {
+fn setup(
+    mut commands: Commands,
+    spawn: Res<Spawn>,
+    view: Res<ViewDistance>,
+    screen: Res<Screen>,
+    origin: Res<RenderOrigin>,
+) {
     let reach = view.metres();
+    let haze = haze(&level_info(origin.version, origin.level));
     commands.spawn((
         // No press of W has happened yet, so none can be half of a double-tap.
         Player { last_tap: f32::NEG_INFINITY, eye: Posture::Standing.eye_height(), ..default() },
@@ -170,7 +190,7 @@ fn setup(mut commands: Commands, spawn: Res<Spawn>, view: Res<ViewDistance>, scr
         Bloom { intensity: 0.12, ..Bloom::NATURAL },
         // The fog starts well short of the last loaded chunk and is complete
         // before it, so chunks appear and disappear inside the haze.
-        DistanceFog { color: HAZE, falloff: FogFalloff::Linear { start: reach * 0.35, end: reach - 4.0 }, ..default() },
+        DistanceFog { color: haze, falloff: FogFalloff::Linear { start: reach * 0.35, end: reach - 4.0 }, ..default() },
         // Draw depth only first, then colour. With the depth known up
         // front, the costly surface shader runs once per pixel, for the
         // nearest surface, instead of also for every wall hidden behind it.
@@ -232,6 +252,9 @@ fn fall(height: f32, rising: f32, dt: f32) -> (f32, f32) {
     if height <= 0.0 { (0.0, 0.0) } else { (height, rising) }
 }
 
+// A system's parameters are its declared inputs, so a long list here is
+// information rather than clutter.
+#[allow(clippy::too_many_arguments)]
 pub fn walk(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -239,6 +262,7 @@ pub fn walk(
     ceiling: Res<Ceiling>,
     cache: Res<ChunkCache>,
     mut surroundings: ResMut<Surroundings>,
+    mut travel: ResMut<Travel>,
     player: Single<(&mut Transform, &mut Player, &mut Projection)>,
 ) {
     let (mut transform, mut player, mut projection) = player.into_inner();
@@ -332,10 +356,55 @@ pub fn walk(
     if dt > 0.0 {
         player.velocity = (to - from) / dt;
     }
+
+    // Stepping through a portal or a wall that is not there.
+    if let Some(crossing) = crossed(plan, here, moved) {
+        let piece = plan.base.offset(crossing.cell.x, crossing.cell.y);
+        travel.0 = Some(match crossing.edge {
+            // A portal: come out of the paired doorway in mid-stride, in
+            // the same place relative to it. No blackout: the doorway was
+            // already dark.
+            Edge::Portal => Trip {
+                level: origin.level,
+                cell: portal_partner(origin.version, origin.level, piece),
+                offset: moved - crossing.cell.as_vec2() * CELL,
+                find_floor: false,
+                blackout: false,
+            },
+            // Anything else here is a phasing wall: off the level entirely.
+            _ => {
+                let (level, cell) = noclip_exit(origin.version, origin.level, piece);
+                Trip { level, cell, offset: Vec2::ZERO, find_floor: true, blackout: true }
+            }
+        });
+    }
+
+    // Stairs: the steps carry the eyes up or down, and partway along the
+    // flight the player arrives on the other level, at the same place.
+    let mut lift = 0.0;
+    for stair in plan.stairs() {
+        let Some(depth) = stair.depth_of(moved - stair.cell.as_vec2() * CELL) else { continue };
+        let climbed = depth / 2.0 * ceiling.0;
+        lift = if stair.up { climbed } else { -climbed };
+        if depth > STAIR_COMMIT
+            && travel.0.is_none()
+            && let Some(level) = stair_exit(origin.version, origin.level, stair.up)
+        {
+            let cell = origin.cell_at(to);
+            travel.0 = Some(Trip { level, cell, offset: Vec2::ZERO, find_floor: true, blackout: true });
+            lift = 0.0;
+        }
+    }
+    player.lift += (lift - player.lift) * (1.0 - (-14.0 * dt).exp());
+    if travel.0.is_some_and(|trip| trip.blackout) {
+        // Arrive standing on the floor, not mid-step or mid-jump.
+        (player.lift, player.height, player.rising) = (0.0, 0.0, 0.0);
+    }
+
     // The eyes glide to their new height rather than snapping.
     let eye = player.posture.eye_height();
     player.eye += (eye - player.eye) * (1.0 - (-10.0 * dt).exp());
-    transform.translation = plan_to_world(to, player.eye + player.height);
+    transform.translation = plan_to_world(to, player.eye + player.height + player.lift);
 
     // Widen the view a little while actually moving fast.
     let fast = sprint && player.velocity.length() > WALK_SPEED * 1.5;

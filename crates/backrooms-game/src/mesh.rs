@@ -16,13 +16,13 @@
 //! the last moment, so skewed walls need no special handling anywhere else.
 
 use backrooms_core::Edge;
-use backrooms_core::chunk::{CRAWL_HEIGHT_MM, WINDOW_HEAD_MM, WINDOW_SILL_MM};
+use backrooms_core::chunk::{CRAWL_HEIGHT_MM, PORTAL_HEIGHT_MM, WINDOW_HEAD_MM, WINDOW_SILL_MM};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 
 use crate::bake::{Baker, NUDGE, ROWS};
-use crate::space::{CELL, Plan, WALL_HALF, plan_to_world};
+use crate::space::{CELL, Plan, PlanStair, WALL_HALF, plan_to_world};
 
 /// Cells along one side of a chunk.
 const N: i32 = backrooms_core::coord::CHUNK_SIZE;
@@ -33,6 +33,16 @@ pub const LUX_PER_UNIT: f32 = 1000.0;
 const CRAWL_HEIGHT: f32 = CRAWL_HEIGHT_MM as f32 / 1000.0;
 const WINDOW_SILL: f32 = WINDOW_SILL_MM as f32 / 1000.0;
 const WINDOW_HEAD: f32 = WINDOW_HEAD_MM as f32 / 1000.0;
+const PORTAL_HEIGHT: f32 = PORTAL_HEIGHT_MM as f32 / 1000.0;
+
+/// What kind of surface a face is, stored in the vertex colour's alpha for
+/// the shader: an ordinary wall, floor or ceiling; plain trim; or a void
+/// that gives back no light at all.
+const PLAIN: f32 = 1.0;
+const TRIM: f32 = 0.0;
+const VOID: f32 = 0.5;
+/// Steps in a flight of stairs.
+const STEPS: usize = 8;
 
 /// Raw triangle data, kept separate from Bevy's `Mesh` so it can be built on
 /// a worker thread and tested without a renderer.
@@ -77,6 +87,9 @@ fn profile(edge: Edge, ceiling: f32) -> (Vec<Span>, Option<Span>) {
         Edge::Wall => (vec![(0.0, ceiling)], None),
         Edge::Window => (vec![(0.0, WINDOW_SILL), (WINDOW_HEAD, ceiling)], Some((WINDOW_SILL, WINDOW_HEAD))),
         Edge::Crawl => (vec![(CRAWL_HEIGHT, ceiling)], Some((0.0, CRAWL_HEIGHT))),
+        Edge::Portal => (vec![(PORTAL_HEIGHT, ceiling)], Some((0.0, PORTAL_HEIGHT))),
+        // A wall that is not there looks exactly like one that is.
+        Edge::Phase => (vec![(0.0, ceiling)], None),
     }
 }
 
@@ -100,9 +113,10 @@ impl<P: Plan> Builder<'_, P> {
     /// makes a face invisible. Checking it in one place beats reasoning
     /// about it for every wall direction.)
     ///
-    /// `trim` marks plain surfaces such as the inside of an opening, which
-    /// the shader paints as woodwork rather than as wallpaper or carpet.
-    fn quad(&mut self, corners: [Corner; 4], facing: Vec3, trim: bool) {
+    /// `finish` is one of `PLAIN`, `TRIM` (the inside of an opening, which
+    /// the shader paints as woodwork rather than as wallpaper or carpet) and
+    /// `VOID`.
+    fn quad(&mut self, corners: [Corner; 4], facing: Vec3, finish: f32) {
         // Out-of-true lattice points drag their surroundings with them.
         let world = corners.map(|c| plan_to_world(c.plan + self.plan.warp(c.plan / CELL), c.height));
         let face = (world[1] - world[0]).cross(world[2] - world[0]);
@@ -117,7 +131,7 @@ impl<P: Plan> Builder<'_, P> {
             let c = corners[i];
             self.out.positions.push(world[i].to_array());
             self.out.normals.push(normal.to_array());
-            self.out.colors.push([c.condition.x, c.condition.y, c.lux / LUX_PER_UNIT, if trim { 0.0 } else { 1.0 }]);
+            self.out.colors.push([c.condition.x, c.condition.y, c.lux / LUX_PER_UNIT, finish]);
         }
         self.out.indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
     }
@@ -144,7 +158,7 @@ impl<P: Plan> Builder<'_, P> {
         condition: [Vec2; 2],
         lux: [[f32; ROWS]; 2],
         (low, high): (f32, f32),
-        trim: bool,
+        finish: f32,
     ) {
         // The bottom, any baker height strictly inside the range, the top.
         let mut levels = vec![low];
@@ -159,7 +173,7 @@ impl<P: Plan> Builder<'_, P> {
                 lux: self.lux_at(&lux[end], height),
             };
             let corners = [at(0, pair[0]), at(1, pair[0]), at(1, pair[1]), at(0, pair[1])];
-            self.quad(corners, plan_to_world(facing, 0.0), trim);
+            self.quad(corners, plan_to_world(facing, 0.0), finish);
         }
     }
 }
@@ -294,7 +308,7 @@ fn slab<P: Plan>(b: &mut Builder<P>, baker: &Baker<P>, run: Run, x: i32, y: i32,
         face_lux[index] = lux;
         let across = line + sign * half;
         for &range in &solid {
-            b.upright(at(from, across) * CELL, at(to, across) * CELL, facing, condition, lux, range, false);
+            b.upright(at(from, across) * CELL, at(to, across) * CELL, facing, condition, lux, range, PLAIN);
         }
     }
 
@@ -312,7 +326,7 @@ fn slab<P: Plan>(b: &mut Builder<P>, baker: &Baker<P>, run: Run, x: i32, y: i32,
                     c,
                     [lux, lux],
                     range,
-                    false,
+                    PLAIN,
                 );
             }
         }
@@ -339,7 +353,7 @@ fn slab<P: Plan>(b: &mut Builder<P>, baker: &Baker<P>, run: Run, x: i32, y: i32,
             condition: condition[end],
             lux: b.lux_at(&lining[end], height),
         };
-        b.quad([corner(0, -half), corner(1, -half), corner(1, half), corner(0, half)], facing, true);
+        b.quad([corner(0, -half), corner(1, -half), corner(1, half), corner(0, half)], facing, TRIM);
     }
     for (end, step, sign) in [(0, -1, 1.0), (1, 1, -1.0)] {
         if kind(step) != here {
@@ -354,7 +368,75 @@ fn slab<P: Plan>(b: &mut Builder<P>, baker: &Baker<P>, run: Run, x: i32, y: i32,
                 c,
                 lux,
                 (low, high),
-                true,
+                TRIM,
+            );
+        }
+    }
+
+    // A portal's doorway is filled with darkness: a sheet in the middle of
+    // the wall's thickness, seen from both sides.
+    if here == Edge::Portal {
+        for sign in [-1.0, 1.0] {
+            let c = |end: usize, height: f32| Corner {
+                plan: at(start + end as f32, line) * CELL,
+                height,
+                condition: condition[end],
+                lux: 0.0,
+            };
+            b.quad([c(0, low), c(1, low), c(1, high), c(0, high)], plan_to_world(across_axis * sign, 0.0), VOID);
+        }
+    }
+}
+
+/// Builds a stairwell's flight of steps (the booth around it is ordinary
+/// wall and already built). `corner` is the booth's south-west corner in
+/// metres.
+fn steps<P: Plan>(b: &mut Builder<P>, stair: &PlanStair, corner: Vec2, lux: f32) {
+    let rise = b.ceiling / STEPS as f32 * if stair.up { 1.0 } else { -1.0 };
+    let going = 2.0 / STEPS as f32;
+    let (dx, dy) = stair.facing.step();
+    let towards_entry = Vec3::new(dx as f32, 0.0, -dy as f32);
+    let point = |across: f32, depth: f32, height: f32| Corner {
+        plan: corner + stair.place(across, depth),
+        height,
+        condition: Vec2::ZERO,
+        lux,
+    };
+    for i in 0..STEPS {
+        let (near, far) = (i as f32 * going, (i + 1) as f32 * going);
+        // Going up, each tread is one rise above the last; going down, the
+        // first tread is level with the floor's edge and they drop from
+        // there.
+        let tread = if stair.up { (i + 1) as f32 * rise } else { i as f32 * rise + rise };
+        b.quad(
+            [point(0.0, near, tread), point(2.0, near, tread), point(2.0, far, tread), point(0.0, far, tread)],
+            Vec3::Y,
+            TRIM,
+        );
+        if stair.up {
+            // The riser in front of the tread, facing whoever climbs.
+            let below = tread - rise;
+            b.quad(
+                [point(0.0, near, below), point(2.0, near, below), point(2.0, near, tread), point(0.0, near, tread)],
+                towards_entry,
+                TRIM,
+            );
+        }
+    }
+    if !stair.up {
+        // The sides and far end of the stair pit, lost in darkness.
+        let deep = -b.ceiling;
+        let sides = [
+            ((0.0, 0.0), (0.0, 2.0), stair.place(1.0, 1.0) - stair.place(0.0, 1.0)),
+            ((2.0, 0.0), (2.0, 2.0), stair.place(1.0, 1.0) - stair.place(2.0, 1.0)),
+            ((0.0, 2.0), (2.0, 2.0), stair.place(1.0, 1.0) - stair.place(1.0, 2.0)),
+            ((0.0, 0.0), (2.0, 0.0), stair.place(1.0, 1.0) - stair.place(1.0, 0.0)),
+        ];
+        for ((a0, d0), (a1, d1), inward) in sides {
+            b.quad(
+                [point(a0, d0, deep), point(a1, d1, deep), point(a1, d1, 0.0), point(a0, d0, 0.0)],
+                plan_to_world(inward, 0.0),
+                VOID,
             );
         }
     }
@@ -377,6 +459,15 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
     };
     let m = |cells: i32| cells as f32 * CELL;
 
+    // Stairwells whose booth lies in this chunk.
+    let stairs: Vec<PlanStair> =
+        plan.stairs().iter().copied().filter(|s| (0..N).contains(&s.cell.x) && (0..N).contains(&s.cell.y)).collect();
+    for stair in &stairs {
+        let corner = stair.cell.as_vec2() * CELL;
+        let lux = Baker::<P>::floor_total(baker.floor_direct(stair.cell.as_vec2() + Vec2::splat(2.0)));
+        steps(&mut b, stair, corner, lux);
+    }
+
     // Floor and ceiling, one quad per cell.
     let light = corner_light(plan, baker);
     let light_at = |x: i32, y: i32, quadrant: usize| light[(y * (N + 1) + x) as usize][quadrant];
@@ -385,6 +476,10 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
             if plan.solid(x, y) {
                 continue;
             }
+            // In a stairwell the steps replace the floor (going down) or
+            // pass through a dark hole in the ceiling (going up).
+            let stair =
+                stairs.iter().find(|s| (s.cell.x..s.cell.x + 4).contains(&x) && (s.cell.y..s.cell.y + 4).contains(&y));
             // The four corners of this cell, each with the light of the
             // quadrant that points back into the cell.
             let around = [(x, y, 3), (x + 1, y, 2), (x + 1, y + 1, 0), (x, y + 1, 1)];
@@ -392,13 +487,18 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
                 (0.0, Vec3::Y, Baker::<P>::floor_total as fn(f32) -> f32),
                 (ceiling, Vec3::NEG_Y, Baker::<P>::ceiling_total as fn(f32) -> f32),
             ] {
+                let is_floor = height == 0.0;
+                if stair.is_some_and(|s| s.up != is_floor) && is_floor {
+                    continue;
+                }
                 let corners = around.map(|(cx, cy, quadrant)| Corner {
                     plan: Vec2::new(m(cx), m(cy)),
                     height,
                     condition: at_corner(cx, cy),
                     lux: total(light_at(cx, cy, quadrant)),
                 });
-                b.quad(corners, facing, false);
+                let hole = stair.is_some_and(|s| s.up) && !is_floor;
+                b.quad(corners, facing, if hole { VOID } else { PLAIN });
             }
         }
     }
@@ -435,7 +535,7 @@ pub fn chunk_geometry<P: Plan>(plan: &P, baker: &Baker<P>, ceiling: f32) -> Geom
                 ];
                 for (from, to, facing, condition, samples) in sides {
                     let lux = samples.map(|(dx, dy)| baker.wall(Vec2::new(fx + dx, fy + dy), facing));
-                    b.upright(from, to, facing, condition, lux, (0.0, ceiling), false);
+                    b.upright(from, to, facing, condition, lux, (0.0, ceiling), PLAIN);
                 }
             }
         }
@@ -586,7 +686,7 @@ mod tests {
     /// Vertices of upright, non-trim faces: the wall surfaces proper.
     fn wall_surface(g: &Geometry) -> Vec<Vec3> {
         (0..g.positions.len())
-            .filter(|&i| g.normals[i][1].abs() < 0.5 && g.colors[i][3] > 0.5)
+            .filter(|&i| g.normals[i][1].abs() < 0.5 && g.colors[i][3] == PLAIN)
             .map(|i| Vec3::from_array(g.positions[i]))
             .collect()
     }
@@ -609,7 +709,7 @@ mod tests {
         assert!(over_window.iter().any(|p| (p.y - WINDOW_HEAD).abs() < 1e-3));
         // The opening is lined with trim: a sill, a head and two jambs.
         let trim: Vec<Vec3> = (0..g.positions.len())
-            .filter(|&i| g.colors[i][3] < 0.5)
+            .filter(|&i| g.colors[i][3] == TRIM)
             .map(|i| Vec3::from_array(g.positions[i]))
             .collect();
         assert!(!trim.is_empty());
@@ -625,7 +725,7 @@ mod tests {
         // Take the wall faces of the two crawl pieces: they start at the top
         // of the hole, not at the floor.
         let lowest = (0..g.positions.len())
-            .filter(|&i| g.normals[i][0].abs() > 0.5 && g.colors[i][3] > 0.5)
+            .filter(|&i| g.normals[i][0].abs() > 0.5 && g.colors[i][3] == PLAIN)
             .map(|i| Vec3::from_array(g.positions[i]))
             .filter(|p| -p.z > 2.0 + 0.01 && -p.z < 3.0 - 0.01)
             .map(|p| p.y)
@@ -633,6 +733,76 @@ mod tests {
         // (No vertex lies strictly inside the two pieces' length except at
         // their shared middle, at 2.5 m.)
         assert!((lowest - CRAWL_HEIGHT).abs() < 1e-3, "crawl pieces start at {lowest} m");
+    }
+
+    /// Vertices with the given finish.
+    fn with_finish(g: &Geometry, finish: f32) -> Vec<Vec3> {
+        (0..g.positions.len()).filter(|&i| g.colors[i][3] == finish).map(|i| Vec3::from_array(g.positions[i])).collect()
+    }
+
+    #[test]
+    fn a_portal_is_a_doorway_full_of_darkness_and_a_phase_wall_is_just_a_wall() {
+        let wall = vec![(4, 3), (4, 6)];
+        let plain = build(&TestPlan { west: [wall.clone(), vec![(4, 4), (4, 5)]].concat(), ..Default::default() }, &[]);
+        let phase =
+            build(&TestPlan { west: wall.clone(), west_phases: vec![(4, 4), (4, 5)], ..Default::default() }, &[]);
+        // Nothing gives a phasing wall away.
+        assert_eq!(phase.positions, plain.positions);
+        assert_eq!(phase.colors, plain.colors);
+
+        let portal = build(&TestPlan { west: wall, west_portals: vec![(4, 4), (4, 5)], ..Default::default() }, &[]);
+        assert_consistent(&portal);
+        let dark = with_finish(&portal, VOID);
+        assert!(!dark.is_empty());
+        // The dark sheet fills the doorway exactly: on the wall's line,
+        // floor to lintel, one metre long.
+        assert!(dark.iter().all(|p| (p.x - 2.0).abs() < 1e-4 && p.y >= 0.0 && p.y <= PORTAL_HEIGHT + 1e-4));
+        assert!(dark.iter().all(|p| -p.z >= 2.0 - 1e-4 && -p.z <= 3.0 + 1e-4));
+        // And above it the wall carries on to the ceiling.
+        let over: Vec<f32> = wall_surface(&portal).iter().filter(|p| (-p.z - 2.5).abs() < 0.4).map(|p| p.y).collect();
+        assert!(over.iter().all(|&h| h >= PORTAL_HEIGHT - 1e-3));
+    }
+
+    #[test]
+    fn stairs_up_rise_into_a_dark_hole_and_stairs_down_replace_the_floor() {
+        use backrooms_core::Dir;
+        for up in [true, false] {
+            let stair = PlanStair { cell: IVec2::new(4, 8), facing: Dir::South, up };
+            let plan = TestPlan { stairs: vec![stair], ..Default::default() };
+            let g = build(&plan, &[]);
+            assert_consistent(&g);
+            let treads: Vec<Vec3> = (0..g.positions.len())
+                .filter(|&i| g.colors[i][3] == TRIM && g.normals[i][1] > 0.9)
+                .map(|i| Vec3::from_array(g.positions[i]))
+                .collect();
+            assert_eq!(treads.len(), STEPS * 4);
+            // Inside the booth's 2 m square, at x 2..4, north 4..6.
+            assert!(
+                treads
+                    .iter()
+                    .all(|p| p.x >= 2.0 - 1e-4 && p.x <= 4.0 + 1e-4 && -p.z >= 4.0 - 1e-4 && -p.z <= 6.0 + 1e-4)
+            );
+            let (lowest, highest) = treads.iter().fold((f32::MAX, f32::MIN), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+            // The booth's floor cells (16 of them) and where the steps go.
+            let floor_in_booth = (0..g.positions.len())
+                .filter(|&i| g.colors[i][3] == PLAIN && g.normals[i][1] > 0.9)
+                .map(|i| Vec3::from_array(g.positions[i]))
+                .filter(|p| p.x > 2.1 && p.x < 3.9 && -p.z > 4.1 && -p.z < 5.9)
+                .count();
+            if up {
+                assert!(lowest > 0.0 && (highest - H).abs() < 1e-3, "treads from {lowest} to {highest}");
+                assert!(floor_in_booth > 0, "the floor under rising stairs is still there");
+                assert!(with_finish(&g, VOID).iter().all(|p| (p.y - H).abs() < 1e-4), "the hole is in the ceiling");
+            } else {
+                assert!(highest <= 0.0 && (lowest + H).abs() < 1e-3, "treads from {highest} to {lowest}");
+                assert_eq!(floor_in_booth, 0, "floor left over a descending stair");
+                assert!(with_finish(&g, VOID).iter().all(|p| p.y <= 1e-4));
+            }
+            // Entered from the south, the steps nearest the entry are the
+            // ones closest to floor level.
+            let nearest = treads.iter().min_by(|a, b| (-a.z).total_cmp(&-b.z)).unwrap();
+            assert!(nearest.y.abs() <= H / STEPS as f32 + 1e-3);
+        }
     }
 
     #[test]
@@ -650,7 +820,7 @@ mod tests {
         assert_eq!(near(stayed), 0);
         // The wall that starts there is no longer square to the grid.
         let slanted = (0..g.positions.len())
-            .filter(|&i| g.colors[i][3] > 0.5 && g.normals[i][1].abs() < 0.5)
+            .filter(|&i| g.colors[i][3] == PLAIN && g.normals[i][1].abs() < 0.5)
             .any(|i| g.normals[i][0].abs() > 0.5 && g.normals[i][2].abs() > 0.01);
         assert!(slanted, "the wall stayed square");
         // Far from the bent point nothing moved.

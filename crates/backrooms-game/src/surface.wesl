@@ -17,7 +17,11 @@ struct Surface {
     origin: vec2<i32>,
     // Ceiling height in metres.
     ceiling: f32,
-    pad: f32,
+    // What the level is made of: 0 wallpaper and carpet, 1 concrete,
+    // 2 painted office, 3 glazed tile.
+    theme: u32,
+    // Colour cast of the level's main surface.
+    tint: vec4<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(100) var<uniform> surface: Surface;
@@ -148,6 +152,65 @@ fn wallpaper(along_cell: i32, along_f: f32, across: i32, height: f32, damp_in: f
     return Look(color, mix(0.82, 0.55, max(wet, skirting)));
 }
 
+// Bare concrete: blotchy grey with fine grit and the odd dark stain.
+fn concrete(cell: vec2<i32>, f: vec2<f32>, salt: u32, damp_in: f32, wear_in: f32, cpp: f32, shade: f32) -> Look {
+    let blotch = cloud(cell, f, salt);
+    let grit = (noise(cell, f, 32, salt + 5u) - 0.5) * keep(cpp, 32.0);
+    var color = surface.tint.rgb * shade * (0.82 + 0.3 * blotch + 0.12 * grit);
+    let stain = smoothstep(0.45, 0.8, wear_in * 0.6 + cloud(cell, f, salt + 9u) * 0.5);
+    color = color * (1.0 - 0.35 * stain);
+    let wet = smoothstep(0.1, 0.5, damp_in + (blotch - 0.5) * 0.3);
+    color = color * mix(1.0, 0.5, wet);
+    return Look(color, mix(0.9, 0.45, wet));
+}
+
+// Glazed tiles a quarter of a metre square, with dark grout.
+fn glazed(cell: vec2<i32>, f: vec2<f32>, salt: u32, damp_in: f32, wear_in: f32, cpp: f32) -> Look {
+    let g = f * 2.0;
+    let t = g - floor(g);
+    let edge = min(min(t.x, 1.0 - t.x), min(t.y, 1.0 - t.y));
+    let grout = (1.0 - smoothstep(0.02, 0.05, edge)) * keep(cpp, 6.0);
+    let tile = hash(cell * 2 + vec2<i32>(floor(g)), salt);
+    var color = surface.tint.rgb * 0.62 * (0.93 + 0.1 * tile);
+    // Grime gathers in the grout first, then spreads.
+    let grime = smoothstep(0.35, 0.9, wear_in + (cloud(cell, f, salt + 3u) - 0.5) * 0.6);
+    color = mix(color, vec3<f32>(0.16, 0.15, 0.11), grout * (0.6 + 0.4 * grime) + grime * 0.25);
+    let wet = smoothstep(0.1, 0.5, damp_in);
+    return Look(color * mix(1.0, 0.75, wet), mix(0.3, 0.15, wet));
+}
+
+// A plainly painted wall with a skirting board.
+fn painted(along_cell: i32, along_f: f32, across: i32, height: f32, damp_in: f32, wear_in: f32) -> Look {
+    let salt = bitcast<u32>(across) * 0x27D4EB2Fu;
+    let v = height * 2.0;
+    let wall_cell = vec2<i32>(along_cell, i32(floor(v)));
+    let wall_f = vec2<f32>(along_f, v - floor(v));
+    let grime = cloud(wall_cell, wall_f, salt + 2u);
+    let low = 1.0 - smoothstep(0.0, 1.2, height);
+    var color = surface.tint.rgb * 0.7 * (1.0 - (0.08 + 0.4 * wear_in) * grime * (0.5 + 0.5 * low));
+    let tide = damp_in * 1.6 + (grime - 0.5) * 0.6 - height * 0.55;
+    color = color * mix(1.0, 0.6, smoothstep(0.0, 0.25, tide));
+    let skirting = 1.0 - smoothstep(0.085, 0.09, height);
+    color = mix(color, vec3<f32>(0.10, 0.10, 0.11), skirting);
+    return Look(color, mix(0.7, 0.5, skirting));
+}
+
+// The look of a wall face in the level's theme.
+fn wall(along_cell: i32, along_f: f32, across: i32, height: f32, damp: f32, wear: f32, cpp: f32) -> Look {
+    let wall_cell = vec2<i32>(along_cell, i32(floor(height * 2.0)) + across * 31);
+    let wall_f = vec2<f32>(along_f, height * 2.0 - floor(height * 2.0));
+    if surface.theme == 1u {
+        return concrete(wall_cell, wall_f, 60u, damp * (1.0 - height * 0.4), wear, cpp, 0.42);
+    } else if surface.theme == 2u {
+        return painted(along_cell, along_f, across, height, damp, wear);
+    } else if surface.theme == 3u {
+        return glazed(wall_cell, wall_f, 70u, damp, wear, cpp);
+    }
+    var look = wallpaper(along_cell, along_f, across, height, damp, wear, cpp);
+    look.color = look.color * surface.tint.rgb;
+    return look;
+}
+
 @fragment
 fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> FragmentOutput {
     var pbr_input = pbr_input_from_standard_material(in, is_front);
@@ -161,26 +224,51 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let cells_per_pixel = max(length(fwidth(plan)), fwidth(height) * 2.0);
 
     // The mesher stores moisture in red, wear in green, baked light (in
-    // thousands of lux) in blue, and 0 in alpha for trim.
+    // thousands of lux) in blue, and the kind of surface in alpha: 1 for
+    // ordinary surfaces, 0 for trim, 0.5 for a void.
     let damp = in.color.r;
     let wear = in.color.g;
     let lux = in.color.b * 1000.0;
 
     let n = in.world_normal;
     var look: Look;
-    if in.color.a < 0.5 {
-        // Trim: the inside of a window or crawl hole, painted like the
-        // skirting board.
+    if in.color.a > 0.25 && in.color.a < 0.75 {
+        // A void: the dark in a portal, a stair pit or the hole stairs
+        // rise into. It gives back no light and is not touched by the haze,
+        // so nothing can be made out in it.
+        var dark: FragmentOutput;
+        dark.color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        return dark;
+    }
+    if in.color.a < 0.25 {
+        // Trim: the inside of an opening, or a stair tread.
         let grain = cloud(cell, f, 50u);
-        look = Look(vec3<f32>(0.20, 0.13, 0.03) * (0.8 + 0.4 * grain), 0.6);
+        let wood = vec3<f32>(0.20, 0.13, 0.03);
+        let plain = surface.tint.rgb * 0.22;
+        look = Look(mix(wood, plain, f32(surface.theme != 0u)) * (0.8 + 0.4 * grain), 0.6);
     } else if n.y > 0.5 {
-        look = carpet(cell, f, damp, wear, cells_per_pixel);
+        if surface.theme == 1u {
+            look = concrete(cell, f, 80u, damp, wear, cells_per_pixel, 0.3);
+        } else if surface.theme == 3u {
+            look = glazed(cell, f, 90u, damp, wear, cells_per_pixel);
+        } else {
+            look = carpet(cell, f, damp, wear, cells_per_pixel);
+            if surface.theme == 2u {
+                // Office carpet: the same pile, drained to a blue-grey.
+                let grey = dot(look.color, vec3<f32>(0.4, 0.5, 0.1));
+                look.color = vec3<f32>(0.75, 0.8, 0.95) * grey * 1.3;
+            }
+        }
     } else if n.y < -0.5 {
-        look = tiles(cell, f, damp, wear, cells_per_pixel);
+        if surface.theme == 1u {
+            look = concrete(cell, f, 85u, damp * 0.5, wear, cells_per_pixel, 0.36);
+        } else {
+            look = tiles(cell, f, damp, wear, cells_per_pixel);
+        }
     } else if abs(n.x) > 0.5 {
-        look = wallpaper(cell.y, f.y, cell.x, height, damp, wear, cells_per_pixel);
+        look = wall(cell.y, f.y, cell.x, height, damp, wear, cells_per_pixel);
     } else {
-        look = wallpaper(cell.x, f.x, cell.y + 0x4000, height, damp, wear, cells_per_pixel);
+        look = wall(cell.x, f.x, cell.y + 0x4000, height, damp, wear, cells_per_pixel);
     }
 
     pbr_input.material.base_color = vec4<f32>(look.color, 1.0);

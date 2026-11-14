@@ -313,7 +313,7 @@ fn the_level_has_variety() {
 
 #[test]
 fn reserved_levels_have_no_chunks() {
-    let reserved = LevelId::new(1).unwrap();
+    let reserved = LevelId::new(127).unwrap();
     assert_eq!(generate_chunk(V1, reserved, ChunkPos::new(0, 0)), Err(GenError::LevelNotBuilt(reserved)));
 }
 

@@ -46,6 +46,7 @@ fn setup(mut commands: Commands) {
         TextFont { font_size: FontSize::Px(15.0), ..default() },
         TextColor(Color::srgba(0.95, 0.93, 0.8, 0.85)),
         Node { position_type: PositionType::Absolute, top: px(10), left: px(12), ..default() },
+        GlobalZIndex(1),
     ));
 }
 

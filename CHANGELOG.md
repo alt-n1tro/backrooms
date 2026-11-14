@@ -4,6 +4,44 @@ Every delivery gets a version (MAJOR.MINOR.PATCH), however small the change.
 "Generator" lines say whether the world itself changed: once generator v1
 ships, any such change will require a new generator version instead.
 
+## 0.6.0 — Levels, portals, noclip, stairs
+
+World (generator v1 changed; golden hashes re-blessed):
+
+- 68 levels are built. Levels 1 to 63 are the yellow variants: Level 0's
+  generator with its knobs turned by a hash of the level id (ceiling
+  height, room sizes, corridors, doorways, columns, dead and flickering
+  lights, damp, wear, skew, wallpaper tint). Levels 64 to 67 are the
+  WAREHOUSE (concrete, 5.2 m ceilings, vast halls), the OFFICE (white
+  walls, grey carpet, small rooms off corridors), the TUNNELS (low, dark,
+  all corridor) and the TILES. These four reuse the room generator with
+  different parameters and surfaces; they are not yet unique generators.
+- Portals: a rare plain wall piece is a dark doorway paired with the same
+  piece of a block at least 500 km away on the same level. Both ends roll
+  the same hash, so most are two-way; where the far end is not a wall, it
+  is one-way.
+- Noclip: a rarer wall piece looks like wall and is not there. Each leads
+  to a hashed built level at a hashed place.
+- Stairs: very rarely, a room at least 6 m each way has a walled stairwell
+  booth with one open side, going up or down to the nearest built level in
+  that direction of the stack (empty slots are stepped over).
+
+Game:
+
+- Travel between places and levels: the render origin is redeclared at the
+  destination, the scene is rebuilt there, and the surface material, fog
+  and ceiling height are re-dressed for the level.
+- Portals show nothing of where they lead (the doorway is black) and are
+  walked through without a break. Noclip and stairs arrive behind a cut to
+  black.
+- Stair flights are drawn, and carry the view up or down as they are
+  climbed.
+- Four surface themes in the shader, and a per-level tint.
+
+Tools:
+
+- `backrooms find portal|noclip|stairs`; maps and chunk text show them.
+
 ## 0.5.0 — Rooms
 
 World (generator v1 changed; golden hashes re-blessed):

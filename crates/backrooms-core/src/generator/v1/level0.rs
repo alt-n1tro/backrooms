@@ -43,7 +43,7 @@
 
 use super::{level_key, purpose};
 use crate::GeneratorVersion;
-use crate::chunk::{Cell, Chunk, Edge, Fixture, LightState, N, Skew};
+use crate::chunk::{Cell, Chunk, Dir, Edge, Fixture, LightState, N, Skew, Stair};
 use crate::coord::{CHUNK_SIZE, CellPos, ChunkPos, RegionPos};
 use crate::hash::{Key, ONE, Q16, lerp, pct};
 use crate::level::LevelId;
@@ -102,6 +102,10 @@ pub struct Params {
     pub skew_floor: Q16,
     /// Furthest a lattice point is pushed, per axis, in centimetres.
     pub skew_cm: u8,
+    /// Whether there is a level for stairs to lead up or down to. Filled in
+    /// from the stack, not chosen.
+    pub stairs_up: bool,
+    pub stairs_down: bool,
 }
 
 pub const LEVEL_0: Params = Params {
@@ -123,7 +127,51 @@ pub const LEVEL_0: Params = Params {
     wear_floor: pct(50),
     skew_floor: pct(84),
     skew_cm: 28,
+    stairs_up: false,
+    stairs_down: false,
 };
+
+/// The parameters and wallpaper tint of one of the yellow levels 1 to 63.
+///
+/// Each is Level 0 with its knobs turned by a hash of the level's id: some
+/// are low and cramped, some airy, some drowned, some mostly dark. A level
+/// keeps its character everywhere, which is what makes arriving on a new
+/// one feel like a different place rather than more of the same.
+pub fn variant(level: LevelId) -> (Params, [u8; 3]) {
+    let key = level_key(level, purpose::VARIANT);
+    // A whole number from `low` to `high`, different for each knob.
+    let pick = |knob: u64, low: u32, high: u32| low + key.with(knob).roll().below(high - low + 1);
+    let base = LEVEL_0;
+    let open = pick(1, 5, 12);
+    let dense = pick(2, 2, 4);
+    let params = Params {
+        // Mostly ordinary ceilings, now and then a very low or very high one.
+        ceiling_mm: match pick(0, 0, 9) {
+            0 => 2200,
+            1 => 3400,
+            2 => 4400,
+            n => 2400 + (n as u16 - 3) * 100,
+        },
+        room_limit: [open as u8, dense as u8],
+        corridor: [pct(pick(3, 5, 45)), pct(pick(4, 45, 95))],
+        extra_door: pct(pick(5, 3, 18)),
+        open_plan: [pct(pick(6, 5, 45)), pct(pick(7, 0, 10))],
+        wide_door: pct(pick(8, 10, 60)),
+        pillars: pct(pick(9, 20, 100)),
+        fixture_missing: pct(pick(10, 2, 30)),
+        dead: [pct(pick(11, 1, 12)), pct(pick(12, 30, 90))],
+        dead_floor: pct(pick(13, 55, 85)),
+        flicker: [pct(pick(14, 0, 5)), pct(pick(15, 10, 50))],
+        damp_floor: pct(pick(16, 35, 85)),
+        wear_floor: pct(pick(17, 25, 75)),
+        skew_floor: pct(pick(18, 70, 95)),
+        skew_cm: pick(19, 10, 40) as u8,
+        ..base
+    };
+    // Tints stay within "sickly yellow": towards green, ochre or bone.
+    let tint = [pick(20, 200, 255) as u8, pick(21, 205, 255) as u8, pick(22, 150, 255) as u8];
+    (params, tint)
+}
 
 /// Which way a wall piece runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -244,6 +292,8 @@ struct Gen<'a> {
     region_lighting: Key,
     feature: Key,
     skew: Key,
+    portal: Key,
+    level: LevelId,
 }
 
 impl<'a> Gen<'a> {
@@ -275,6 +325,8 @@ impl<'a> Gen<'a> {
             region_lighting: level_key(level, purpose::REGION_LIGHTING),
             feature: level_key(level, purpose::FEATURE),
             skew: level_key(level, purpose::SKEW),
+            portal: level_key(level, purpose::PORTAL),
+            level,
         }
     }
 
@@ -467,7 +519,12 @@ impl<'a> Gen<'a> {
         let middle = |edge: Edge| [Edge::Wall, edge, edge, Edge::Wall];
 
         let Some(line) = self.line_between(axis, x, y) else {
-            return OPEN;
+            // Inside a room there is nothing, except around a stairwell.
+            let room = self.room_at(x, y);
+            return match self.stair_of(&room) {
+                Some((bay, facing, _)) if Self::booth_side(bay, axis, x, y).is_some_and(|side| side != facing) => WALL,
+                _ => OPEN,
+            };
         };
         let local = CellPos::new(x, y);
         let (dx, dy) = line.block.delta_to(local);
@@ -502,9 +559,61 @@ impl<'a> Gen<'a> {
         if self.guaranteed_door(&line) == Some(place) || here.chance(extra) {
             return if here.next().chance(self.p.wide_door) { OPEN } else { middle(Edge::Open) };
         }
-        // A plain piece of wall, now and then with a window in it.
+        // A plain piece of wall. Rarely it is one end of a portal: the same
+        // piece of the block a long way off is the other end. Both ends roll
+        // the same hash (of whichever of the two comes first), so they agree.
+        let partner = super::portal_partner(self.level, local);
+        let first = if (partner.x, partner.y) < (x, y) { partner } else { local };
+        let pair = self.portal.with(axis as u64).with_xy(first.x, first.y).roll();
+        if Rarity::of(pair).is_some_and(|tier| tier >= Rarity::Rare) {
+            return middle(Edge::Portal);
+        }
+        // Otherwise it now and then has a window in it, and very rarely is
+        // not really there at all.
         let feature = self.feature.with(axis as u64).with_xy(x, y).roll();
-        if Rarity::of(feature).is_some() { middle(Edge::Window) } else { WALL }
+        match Rarity::of(feature) {
+            None => WALL,
+            Some(Rarity::Common | Rarity::Uncommon) => middle(Edge::Window),
+            Some(_) => middle(Edge::Phase),
+        }
+    }
+
+    /// The stairwell of a room, if it has one: the booth's south-west cell,
+    /// its open side, and whether the steps go up.
+    ///
+    /// Only rooms at least three bays each way can have one, and the booth
+    /// stands clear of the room's walls, so it never blocks a doorway.
+    fn stair_of(&self, room: &Room) -> Option<(CellPos, Dir, bool)> {
+        let (w, h) = room.size();
+        if room.kind != RoomKind::Room || w < 3 || h < 3 || !(self.p.stairs_up || self.p.stairs_down) {
+            return None;
+        }
+        let roll = room.key.with(0x57A1).roll();
+        if !Rarity::of(roll).is_some_and(|tier| tier >= Rarity::Rare) {
+            return None;
+        }
+        let roll = roll.next();
+        let i = 1 + roll.below((w - 2) as u32) as i32;
+        let roll = roll.next();
+        let j = 1 + roll.below((h - 2) as u32) as i32;
+        let roll = roll.next();
+        let facing = [Dir::North, Dir::East, Dir::South, Dir::West][roll.below(4) as usize];
+        // Either way if both exist; otherwise the way that leads somewhere.
+        let up = if self.p.stairs_up && self.p.stairs_down { roll.next().chance(ONE / 2) } else { self.p.stairs_up };
+        Some((room.corner().offset(i * BAY, j * BAY), facing, up))
+    }
+
+    /// Which side of the booth at `bay` the wall piece at `(x, y)` is, if
+    /// any.
+    fn booth_side(bay: CellPos, axis: Axis, x: i32, y: i32) -> Option<Dir> {
+        let at = CellPos::new(x, y);
+        match axis {
+            Axis::EastWest if at == bay => Some(Dir::South),
+            Axis::EastWest if at == bay.offset(0, BAY) => Some(Dir::North),
+            Axis::NorthSouth if at == bay => Some(Dir::West),
+            Axis::NorthSouth if at == bay.offset(BAY, 0) => Some(Dir::East),
+            _ => None,
+        }
     }
 
     /// How far the lattice point at cell corner `(x, y)` is out of true.
@@ -528,7 +637,8 @@ impl<'a> Gen<'a> {
         debug_assert!(x & (PILLAR_PITCH - 1) == 0 && y & (PILLAR_PITCH - 1) == 0);
         let room = self.room_at(x, y);
         let (w, h) = room.size();
-        if room.kind != RoomKind::Room || w < 4 || h < 4 {
+        // A hall with a stairwell has no columns, so the two never collide.
+        if room.kind != RoomKind::Room || w < 4 || h < 4 || self.stair_of(&room).is_some() {
             return false;
         }
         // The lattice point must be inside the room, not on its walls: the
@@ -666,6 +776,15 @@ pub fn generate(version: GeneratorVersion, params: &Params, level: LevelId, pos:
     for j in 0..BAYS {
         for i in 0..BAYS {
             let bay = origin.offset(i * BAY, j * BAY);
+            // A stairwell: note it, and leave its ceiling (or the hole in
+            // it) without a light.
+            let room = g.room_at(bay.x, bay.y);
+            if let Some((at, facing, up)) = g.stair_of(&room)
+                && at == bay
+            {
+                chunk.stair = Some(Stair { x: (i * BAY) as u8, y: (j * BAY) as u8, facing, up });
+                continue;
+            }
             if let Some((state, seed)) = g.fixture_at(bay.x, bay.y) {
                 let fixture = Fixture { x: (i * BAY + 1) as u8, y: (j * BAY + 1) as u8, state, seed };
                 let stored = chunk.push_fixture(fixture);
@@ -766,6 +885,8 @@ mod tests {
                     [w, Edge::Open, Edge::Open, w],
                     [w, Edge::Window, Edge::Window, w],
                     [w, Edge::Crawl, Edge::Crawl, w],
+                    [w, Edge::Portal, Edge::Portal, w],
+                    [w, Edge::Phase, Edge::Phase, w],
                 ];
                 assert!(known.contains(&piece), "odd piece {piece:?} at {x},{y}");
             }
@@ -801,6 +922,88 @@ mod tests {
             assert_eq!(open, 0, "secret room at {x},{y} has a doorway");
         }
         assert!(secrets >= 3, "only {secrets} secret rooms in the sample");
+    }
+
+    /// A generator for a level that has stairs both ways, whatever the stack
+    /// happens to offer level 0.
+    fn with_stairs() -> Gen<'static> {
+        static PARAMS: Params = Params { stairs_up: true, stairs_down: true, ..LEVEL_0 };
+        Gen::new(&PARAMS, LevelId::ZERO)
+    }
+
+    #[test]
+    fn stairwells_are_booths_with_one_open_side_clear_of_the_walls() {
+        let g = with_stairs();
+        let mut found = 0;
+        // Stairwells are rare, so look over a wide area, one probe per room.
+        for j in 0..600 {
+            for i in 0..600 {
+                let (x, y) = (i * BAY * 3, j * BAY * 3);
+                let room = g.room_at(x, y);
+                let Some((bay, facing, _)) = g.stair_of(&room) else { continue };
+                found += 1;
+                let sides = [
+                    (Dir::South, Axis::EastWest, bay),
+                    (Dir::North, Axis::EastWest, bay.offset(0, BAY)),
+                    (Dir::West, Axis::NorthSouth, bay),
+                    (Dir::East, Axis::NorthSouth, bay.offset(BAY, 0)),
+                ];
+                for (side, axis, at) in sides {
+                    let piece = g.segment(axis, at.x, at.y);
+                    let expected = if side == facing { [Edge::Open; 4] } else { [Edge::Wall; 4] };
+                    assert_eq!(piece, expected, "{side:?} side of the booth at {bay:?}");
+                }
+                // The bay in front of the open side is in the same room.
+                let (dx, dy) = facing.step();
+                let front = bay.offset(dx * BAY, dy * BAY);
+                assert_eq!(g.room_at(front.x, front.y).key, room.key);
+                assert!(!g.pillar_at(bay.x & !7, bay.y & !7));
+            }
+        }
+        assert!(found >= 3, "only {found} stairwells found");
+    }
+
+    #[test]
+    fn a_portal_is_matched_by_a_portal_or_open_floor_at_the_far_end() {
+        let g = generator();
+        let (mut portals, mut two_way) = (0, 0);
+        for j in 0..400 {
+            for i in 0..400 {
+                let (x, y) = (i * BAY, j * BAY);
+                for axis in [Axis::NorthSouth, Axis::EastWest] {
+                    if g.segment(axis, x, y)[1] != Edge::Portal {
+                        continue;
+                    }
+                    portals += 1;
+                    let far = super::super::portal_partner(LevelId::ZERO, CellPos::new(x, y));
+                    let other = g.segment(axis, far.x, far.y);
+                    // The far end rolls the same hash. It is a portal too
+                    // unless something else already decided that piece (a
+                    // doorway, open floor, a secret room's wall).
+                    two_way += (other[1] == Edge::Portal) as u32;
+                    assert_ne!(other[1], Edge::Window, "far end at {far:?} should have rolled a portal");
+                    assert_ne!(other[1], Edge::Phase);
+                }
+            }
+        }
+        assert!(portals >= 10, "only {portals} portals");
+        assert!(two_way >= 1, "no two-way portal among {portals}");
+    }
+
+    #[test]
+    fn variants_differ_from_level_0_and_from_each_other() {
+        let mut seen = Vec::new();
+        for id in 1..64u8 {
+            let (params, tint) = variant(LevelId::new(id).unwrap());
+            assert!(params != LEVEL_0);
+            assert!(params.room_limit[0] >= params.room_limit[1]);
+            assert!(params.ceiling_mm >= 2200 && params.ceiling_mm <= 4400);
+            assert!(tint.iter().all(|&c| c >= 150));
+            seen.push((params.ceiling_mm, params.room_limit, tint));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(seen.len() >= 60, "only {} distinct variants", seen.len());
     }
 
     #[test]

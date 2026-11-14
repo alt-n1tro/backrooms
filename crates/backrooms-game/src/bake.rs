@@ -54,6 +54,9 @@ fn passes(edge: Edge) -> f32 {
         Edge::Window => 0.4,
         // A low hole lets a little light spill along the floor.
         Edge::Crawl => 0.12,
+        // A portal is a doorway full of darkness, and a phasing wall looks
+        // (and is lit) exactly like a wall.
+        Edge::Portal | Edge::Phase => 0.0,
     }
 }
 

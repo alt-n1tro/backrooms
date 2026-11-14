@@ -36,6 +36,12 @@ pub enum Edge {
     /// A wall with a low hole at floor level, passable only on hands and
     /// knees.
     Crawl = 3,
+    /// A doorway filled with darkness. Walking through it comes out of
+    /// another doorway far away on the same level.
+    Portal = 4,
+    /// A piece of wall that looks like any other and is not there. Walking
+    /// through it leaves the level.
+    Phase = 5,
 }
 
 impl Edge {
@@ -46,10 +52,14 @@ impl Edge {
             Self::Open => ceiling_mm,
             Self::Wall | Self::Window => 0,
             Self::Crawl => CRAWL_HEIGHT_MM,
+            Self::Portal => PORTAL_HEIGHT_MM,
+            Self::Phase => ceiling_mm,
         }
     }
 }
 
+/// Height of a portal's doorway.
+pub const PORTAL_HEIGHT_MM: u16 = 2100;
 /// Height of a crawl hole.
 pub const CRAWL_HEIGHT_MM: u16 = 700;
 /// A window's opening runs from its sill to its head.
@@ -123,6 +133,9 @@ pub struct Chunk {
     /// `(4 * i, 4 * j)`. Index 4 is the chunk's far boundary, shared with
     /// the neighbouring chunk's index 0.
     pub skew: [[Skew; LATTICE]; LATTICE],
+    /// The stairwell in this chunk, if it has one. They are rare enough
+    /// that a chunk never needs room for two.
+    pub stair: Option<Stair>,
     // A fixed array plus a length is a heap-free stand-in for `Vec`. The two
     // fields are private so the length can never disagree with the contents.
     fixtures: [Fixture; MAX_FIXTURES],
@@ -140,6 +153,7 @@ impl Chunk {
             west: [[Edge::Open; N + 1]; N],
             south: [[Edge::Open; N]; N + 1],
             skew: [[Skew::default(); LATTICE]; LATTICE],
+            stair: None,
             fixtures: [Fixture::default(); MAX_FIXTURES],
             fixture_count: 0,
         }
@@ -204,6 +218,12 @@ impl Chunk {
             // value fills exactly one byte of the word.
             key = key.with(skew.dx as u8 as u64 | (skew.dy as u8 as u64) << 8);
         }
+        // 0 for no stairwell; otherwise every field, offset so that a
+        // stairwell at 0,0 facing north going down is not also 0.
+        key =
+            key.with(self.stair.map_or(0, |s| {
+                1 | (s.x as u64) << 8 | (s.y as u64) << 16 | (s.facing as u64) << 24 | (s.up as u64) << 32
+            }));
         key = key.with(self.fixture_count as u64);
         for f in self.fixtures() {
             key = key.with(f.x as u64 | (f.y as u64) << 8 | (f.state as u64) << 16).with(f.seed as u64);
@@ -213,12 +233,39 @@ impl Chunk {
 }
 
 /// A compass direction. +x is east, +y is north.
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Dir {
-    North,
-    East,
-    South,
-    West,
+    North = 0,
+    East = 1,
+    South = 2,
+    West = 3,
+}
+
+impl Dir {
+    /// One cell's step in this direction, as `(dx, dy)`.
+    pub const fn step(self) -> (i32, i32) {
+        match self {
+            Self::North => (0, 1),
+            Self::East => (1, 0),
+            Self::South => (0, -1),
+            Self::West => (-1, 0),
+        }
+    }
+}
+
+/// A stairwell: a 2 m square booth, walled on three sides, with a flight of
+/// steps leading to the next level up or down the stack.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Stair {
+    /// South-west cell of the booth, in chunk-local coordinates. Always a
+    /// multiple of four.
+    pub x: u8,
+    pub y: u8,
+    /// The open side, where you step on.
+    pub facing: Dir,
+    /// True if the steps go up.
+    pub up: bool,
 }
 
 #[cfg(test)]
@@ -263,6 +310,8 @@ mod tests {
         assert_eq!(Edge::Wall.clearance_mm(2600), 0);
         assert_eq!(Edge::Window.clearance_mm(2600), 0);
         assert_eq!(Edge::Crawl.clearance_mm(2600), CRAWL_HEIGHT_MM);
+        assert_eq!(Edge::Portal.clearance_mm(2600), PORTAL_HEIGHT_MM);
+        assert_eq!(Edge::Phase.clearance_mm(2600), 2600);
     }
 
     #[test]

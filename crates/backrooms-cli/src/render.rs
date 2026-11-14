@@ -11,6 +11,7 @@ use backrooms_core::{Chunk, Edge, LightState};
 /// #  wall or pillar        o  light, on
 /// ~  light, flickering     x  light, dead
 /// =  window                .  crawl hole (: when the wall runs north)
+/// @  portal                ?  wall that is not there
 /// ```
 // The loops below use `x` both as an array index and as a corner number that
 // runs one past the last cell, which the iterator form clippy suggests
@@ -25,12 +26,16 @@ pub fn ascii(chunk: &Chunk) -> String {
         Edge::Wall => "##",
         Edge::Window => "==",
         Edge::Crawl => "..",
+        Edge::Portal => "@@",
+        Edge::Phase => "??",
     };
     let along = |edge: Edge| match edge {
         Edge::Open => ' ',
         Edge::Wall => '#',
         Edge::Window => '=',
         Edge::Crawl => ':',
+        Edge::Portal => '@',
+        Edge::Phase => '?',
     };
     // A corner post is drawn wherever any wall touches the corner.
     let post = |x: usize, y: usize| {
@@ -116,6 +121,9 @@ const CHUNK_GRID: [u8; 3] = [90, 150, 255];
 const WINDOW: [u8; 3] = [60, 170, 230];
 const CRAWL: [u8; 3] = [40, 190, 90];
 const SKEW: [u8; 3] = [220, 40, 200];
+const PORTAL: [u8; 3] = [150, 60, 230];
+const PHASE: [u8; 3] = [230, 50, 50];
+const STAIR: [u8; 3] = [255, 140, 0];
 
 /// Colour of a wall edge on the map, or `None` for no wall.
 fn edge_colour(edge: Edge) -> Option<[u8; 3]> {
@@ -124,6 +132,8 @@ fn edge_colour(edge: Edge) -> Option<[u8; 3]> {
         Edge::Wall => Some(WALL),
         Edge::Window => Some(WINDOW),
         Edge::Crawl => Some(CRAWL),
+        Edge::Portal => Some(PORTAL),
+        Edge::Phase => Some(PHASE),
     }
 }
 
@@ -173,6 +183,11 @@ pub fn map(chunks: &[Chunk], side: u32, scale: u32, layer: Layer, grid: bool) ->
                 let inset = scale / 4;
                 image.rect(px + inset, py + inset, 2 * scale - 2 * inset, scale - 2 * inset, colour);
             }
+        }
+
+        if let Some(stair) = chunk.stair {
+            let (px, py) = cell_px(stair.x as u32, stair.y as u32 + 3);
+            image.rect(px + scale, py + scale, 2 * scale, 2 * scale, STAIR);
         }
 
         if grid {

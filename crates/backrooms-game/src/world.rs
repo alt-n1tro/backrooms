@@ -9,7 +9,7 @@
 //! [`recentre`].
 
 use backrooms_core::coord::{CHUNK_SHIFT, CHUNK_SIZE};
-use backrooms_core::{ChunkPos, LightState};
+use backrooms_core::{CellPos, ChunkPos, LevelId, LightState, level_info};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::tasks::futures::check_ready;
@@ -18,9 +18,10 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on};
 use crate::bake::Baker;
 use crate::lights::{LightKind, PanelMaterials, spawn_fixture};
 use crate::mesh::{Geometry, chunk_geometry};
-use crate::player::Player;
+use crate::player::{Player, Surroundings};
+use crate::screen::Blackout;
 use crate::space::{CELL, ChunkCache, LocalPlan, RenderOrigin, plan_to_world, world_to_plan};
-use crate::surface::{SurfaceHandle, SurfaceMaterial};
+use crate::surface::{SurfaceHandle, SurfaceMaterial, SurfaceUniform, haze};
 
 /// How far the world is drawn, in chunks (8 m each).
 #[derive(Resource, Clone, Copy)]
@@ -45,6 +46,24 @@ pub struct RecentreAfter(pub i32);
 /// must move when the render origin does.
 #[derive(Component)]
 pub struct Anchored;
+
+/// A journey the player is about to make: somewhere too far to walk, or on
+/// another level. Whatever sets this (a portal, a phasing wall, stairs)
+/// only says where; [`travel`] does the moving.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Trip {
+    pub level: LevelId,
+    pub cell: CellPos,
+    /// Where in the cell to arrive, in metres from its south-west corner.
+    pub offset: Vec2,
+    /// Arrive on the nearest open floor rather than exactly at `cell`.
+    pub find_floor: bool,
+    /// Cut to black on arrival, so nothing of the journey is seen.
+    pub blackout: bool,
+}
+
+#[derive(Resource, Default)]
+pub struct Travel(pub Option<Trip>);
 
 /// The chunk entities currently spawned.
 #[derive(Resource, Default)]
@@ -73,9 +92,10 @@ impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LoadedChunks>()
             .init_resource::<Building>()
+            .init_resource::<Travel>()
             // Re-centring must see where the player ended up this frame, and
             // streaming must see the origin re-centring settled on.
-            .add_systems(Update, (recentre, stream_chunks).chain().after(crate::player::walk));
+            .add_systems(Update, (travel, recentre, stream_chunks).chain().after(crate::player::walk));
     }
 }
 
@@ -104,6 +124,63 @@ fn build_chunk(cache: &ChunkCache, pos: ChunkPos, ceiling: f32) -> Built {
         })
         .collect();
     Built { geometry, fixtures }
+}
+
+/// Carries out a [`Trip`].
+///
+/// Nothing is moved through space. The render origin is simply declared to
+/// be at the destination, everything drawn is thrown away, and the streaming
+/// system finds itself with nothing on screen and builds the new
+/// surroundings. Going to another level also swaps the chunk cache and
+/// re-dresses the surface material for that level.
+#[allow(clippy::too_many_arguments)]
+fn travel(
+    mut commands: Commands,
+    mut trip: ResMut<Travel>,
+    mut origin: ResMut<RenderOrigin>,
+    mut cache: ResMut<ChunkCache>,
+    mut ceiling: ResMut<Ceiling>,
+    mut loaded: ResMut<LoadedChunks>,
+    mut building: ResMut<Building>,
+    mut surroundings: ResMut<Surroundings>,
+    mut blackout: ResMut<Blackout>,
+    surface: Res<SurfaceHandle>,
+    mut materials: ResMut<Assets<SurfaceMaterial>>,
+    player: Single<(&mut Transform, &mut DistanceFog), With<Player>>,
+) {
+    // `take` leaves `None` behind, so a trip is made exactly once.
+    let Some(trip) = trip.0.take() else {
+        return;
+    };
+    let (mut transform, mut fog) = player.into_inner();
+    if trip.level != origin.level {
+        *cache = ChunkCache::new(origin.version, trip.level, 4096);
+        origin.level = trip.level;
+    }
+    let info = level_info(origin.version, origin.level);
+    ceiling.0 = info.ceiling_mm as f32 / 1000.0;
+    fog.color = haze(&info);
+
+    let (cell, offset) = if trip.find_floor {
+        (cache.nearest_floor(trip.cell), Vec2::splat(CELL / 2.0))
+    } else {
+        (trip.cell, trip.offset)
+    };
+    origin.cell = cell.chunk().origin();
+    let height = transform.translation.y;
+    transform.translation = plan_to_world(origin.plan_of(cell) + offset, height);
+
+    for (_, entity) in loaded.0.drain() {
+        commands.entity(entity).despawn();
+    }
+    building.0.clear();
+    surroundings.forget();
+    if let Some(mut material) = materials.get_mut(&surface.0) {
+        material.extension.uniform = SurfaceUniform::for_level(&info, origin.cell);
+    }
+    if trip.blackout {
+        blackout.0 = 1.0;
+    }
 }
 
 /// Keeps the render origin within a few chunks of the player.

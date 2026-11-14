@@ -132,27 +132,6 @@ fn start_address(args: &Args) -> Result<Address, String> {
     Ok(Address { version: GeneratorVersion::LATEST, level, cell })
 }
 
-/// The nearest cell to `wanted` that is not inside a pillar, searching
-/// outwards in rings. Deterministic: the same request always lands on the
-/// same cell.
-fn nearest_floor(cache: &ChunkCache, wanted: CellPos) -> CellPos {
-    for ring in 0..8i32 {
-        for dy in -ring..=ring {
-            for dx in -ring..=ring {
-                if dx.abs().max(dy.abs()) != ring {
-                    continue;
-                }
-                let cell = wanted.offset(dx, dy);
-                let (x, y) = cell.local();
-                if !cache.get(cell.chunk()).cells[y][x].solid {
-                    return cell;
-                }
-            }
-        }
-    }
-    wanted
-}
-
 /// Pending screenshot: take it once the scene has had time to appear.
 #[derive(Resource)]
 struct Capture {
@@ -207,7 +186,7 @@ fn main() -> ExitCode {
     // Room for everything in view several times over; beyond that the
     // least recently used chunks are forgotten and regenerated on demand.
     let cache = ChunkCache::new(address.version, address.level, 4096);
-    let start = nearest_floor(&cache, address.cell);
+    let start = cache.nearest_floor(address.cell);
     // The render origin is the corner of the starting chunk. Chunk corners
     // are multiples of 8 m, so every repeating pattern in the surface shader
     // lines up no matter which chunk that is.
@@ -254,7 +233,7 @@ fn main() -> ExitCode {
                 initial_window: UVec2::new(args.size.0, args.size.1),
                 adaptive: args.screenshot.is_none(),
             },
-            surface::SurfacePlugin { ceiling: info.ceiling_mm as f32 / 1000.0 },
+            surface::SurfacePlugin,
             lights::LightsPlugin,
             world::WorldPlugin,
             player::PlayerPlugin,
@@ -314,12 +293,12 @@ mod tests {
             .flat_map(|y| (-50..50).map(move |x| CellPos::new(x * 8, y * 8)))
             .find(|&cell| solid(cell))
             .expect("there are pillars within 200 m of the origin");
-        let start = nearest_floor(&cache, pillar);
+        let start = cache.nearest_floor(pillar);
         assert_ne!(start, pillar);
         let (dx, dy) = pillar.delta_to(start);
         assert_eq!(dx.abs().max(dy.abs()), 1, "should be an adjacent cell");
         assert!(!solid(start));
         // A request that is already floor is left alone.
-        assert_eq!(nearest_floor(&cache, start), start);
+        assert_eq!(cache.nearest_floor(start), start);
     }
 }

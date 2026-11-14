@@ -12,7 +12,7 @@ use core::fmt;
 
 use crate::GeneratorVersion;
 use crate::chunk::Chunk;
-use crate::coord::ChunkPos;
+use crate::coord::{CellPos, ChunkPos};
 use crate::level::{LevelId, LevelInfo};
 
 pub mod v1;
@@ -43,5 +43,31 @@ pub fn generate_chunk(version: GeneratorVersion, level: LevelId, pos: ChunkPos) 
 pub fn level_info(version: GeneratorVersion, level: LevelId) -> LevelInfo {
     match version {
         GeneratorVersion::V1 => v1::level_info(level),
+    }
+}
+
+/// The far end of the portal whose doorway is on the west or south side of
+/// `cell`: the cell in the same position on the same side of the paired
+/// doorway. Applying it twice comes back to `cell`.
+pub fn portal_partner(version: GeneratorVersion, level: LevelId, cell: CellPos) -> CellPos {
+    match version {
+        GeneratorVersion::V1 => v1::portal_partner(level, cell),
+    }
+}
+
+/// Where passing through the phasing wall piece at `cell` lands: any built
+/// level, anywhere on it. The caller moves the arrival to the nearest open
+/// floor.
+pub fn noclip_exit(version: GeneratorVersion, level: LevelId, cell: CellPos) -> (LevelId, CellPos) {
+    match version {
+        GeneratorVersion::V1 => v1::noclip_exit(level, cell),
+    }
+}
+
+/// The level a stairwell on `level` leads to: the nearest built level up
+/// or down the stack, or `None` if there is none that way.
+pub fn stair_exit(version: GeneratorVersion, level: LevelId, up: bool) -> Option<LevelId> {
+    match version {
+        GeneratorVersion::V1 => v1::stair_exit(level, up),
     }
 }

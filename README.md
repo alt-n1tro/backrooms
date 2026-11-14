@@ -4,10 +4,10 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.5.0** (rooms, corridors and secret rooms). See
+Current version: **0.6.0** (68 levels, portals, noclip and stairs). See
 [CHANGELOG.md](CHANGELOG.md).
 
-![A doorway and a hall in Level 0](docs/level0-walk.png)
+![The warehouse, level 64](docs/level0-walk.png)
 
 ## Layout
 
@@ -47,7 +47,8 @@ take seconds.
 | F3 or ` (left of 1) | Show frame rate, render size and version |
 | Escape | Release the mouse |
 
-Where to start:
+Where to start (levels 0 to 63 are the yellow levels; 64 to 67 are the
+warehouse, the office, the tunnels and the tiles):
 
 ```bash
 cargo run --release -p backrooms-game -- --address backrooms://v1/0/120000/-45000
@@ -59,6 +60,10 @@ cargo run --release -p backrooms-game -- --x 2000000000 --y -2000000000
 
 ```bash
 cargo run --release -p backrooms-game -- --random
+```
+
+```bash
+cargo run --release -p backrooms-game -- --level 64
 ```
 
 The 3D view is drawn at a reduced size and stretched to fit the window. The
@@ -92,12 +97,13 @@ answer is a set of options to start the game with:
 cargo run --release -p backrooms-cli -- find crawl
 ```
 
-`find` also takes `window` and `skew`, and `--x`/`--y` to search around
+`find` also takes `window`, `skew`, `portal`, `noclip` and `stairs`, and `--x`/`--y` to search around
 somewhere other than the origin.
 
 Map legend: white lights are on, orange flicker, grey are dead; dark squares
 are pillars; brown patches are damp carpet. Blue wall pieces are windows,
-green are crawl holes (each leads to a secret room), and magenta dots mark lattice points that are out of
+green are crawl holes (each leads to a secret room), purple are portals,
+red are walls that are not there, orange squares are stairwells, and magenta dots mark lattice points that are out of
 true. One chunk is 16 x 16 cells, 8 m
 on a side. `--chunks 512` draws 4 km x 4 km.
 

@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use backrooms_core::{CellPos, Chunk, ChunkPos, Edge, GeneratorVersion, LevelId, LightState};
+use backrooms_core::{CellPos, Chunk, ChunkPos, Dir, Edge, GeneratorVersion, LevelId, LightState};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
@@ -120,6 +120,31 @@ impl ChunkCache {
         chunk
     }
 
+    /// The nearest cell to `wanted` that is open floor (not inside a pillar
+    /// or a stairwell), searching outwards in rings. Deterministic: the
+    /// same request always lands on the same cell.
+    pub fn nearest_floor(&self, wanted: CellPos) -> CellPos {
+        for ring in 0..12i32 {
+            for dy in -ring..=ring {
+                for dx in -ring..=ring {
+                    if dx.abs().max(dy.abs()) != ring {
+                        continue;
+                    }
+                    let cell = wanted.offset(dx, dy);
+                    let chunk = self.get(cell.chunk());
+                    let (x, y) = cell.local();
+                    let in_booth = chunk.stair.is_some_and(|s| {
+                        (s.x as usize..s.x as usize + 4).contains(&x) && (s.y as usize..s.y as usize + 4).contains(&y)
+                    });
+                    if !chunk.cells[y][x].solid && !in_booth {
+                        return cell;
+                    }
+                }
+            }
+        }
+        wanted
+    }
+
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.0.map.lock().expect("no thread panics while holding the cache").chunks.len()
@@ -144,6 +169,10 @@ pub trait Plan {
     /// metres. Only asked for corners where both coordinates are multiples
     /// of four.
     fn skew(&self, x: i32, y: i32) -> Vec2;
+    /// The stairwells on the plan.
+    fn stairs(&self) -> &[PlanStair] {
+        &[]
+    }
 
     /// The wall slab running north-south on the west side of cell `(x, y)`,
     /// or `Edge::Open` if there is none.
@@ -206,6 +235,43 @@ pub struct PlanFixture {
     pub state: LightState,
 }
 
+/// A stairwell as seen from a plan.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlanStair {
+    /// South-west cell of the 2 m booth, relative to the plan's base.
+    pub cell: IVec2,
+    /// The open side.
+    pub facing: Dir,
+    pub up: bool,
+}
+
+impl PlanStair {
+    /// Where a point of the booth is, given as metres across its width and
+    /// metres in from the open side, in metres from the booth's corner.
+    pub fn place(&self, across: f32, depth: f32) -> Vec2 {
+        match self.facing {
+            Dir::South => Vec2::new(across, depth),
+            Dir::North => Vec2::new(2.0 - across, 2.0 - depth),
+            Dir::East => Vec2::new(2.0 - depth, across),
+            Dir::West => Vec2::new(depth, 2.0 - across),
+        }
+    }
+
+    /// How far in from the open side a point is (in metres from the
+    /// booth's corner), or `None` if it is outside the booth.
+    pub fn depth_of(&self, at: Vec2) -> Option<f32> {
+        if at.min_element() < 0.0 || at.max_element() > 2.0 {
+            return None;
+        }
+        Some(match self.facing {
+            Dir::South => at.y,
+            Dir::North => 2.0 - at.y,
+            Dir::East => 2.0 - at.x,
+            Dir::West => at.x,
+        })
+    }
+}
+
 /// One cell of a [`LocalPlan`].
 #[derive(Clone, Copy, Default)]
 struct PlanCell {
@@ -229,6 +295,7 @@ pub struct LocalPlan {
     /// Lattice displacement in metres, one entry per lattice point.
     skew: Vec<Vec2>,
     pub fixtures: Vec<PlanFixture>,
+    stairs: Vec<PlanStair>,
 }
 
 impl LocalPlan {
@@ -238,6 +305,7 @@ impl LocalPlan {
             cells: vec![PlanCell::default(); (SPAN * SPAN) as usize],
             skew: vec![Vec2::ZERO; (LATTICE_SPAN * LATTICE_SPAN) as usize],
             fixtures: Vec::new(),
+            stairs: Vec::new(),
         };
         for cy in -1..=1 {
             for cx in -1..=1 {
@@ -271,6 +339,11 @@ impl LocalPlan {
                             Vec2::new(skew.dx as f32, skew.dy as f32) / 100.0;
                     }
                 }
+                plan.stairs.extend(chunk.stair.map(|stair| PlanStair {
+                    cell: corner + IVec2::new(stair.x as i32, stair.y as i32),
+                    facing: stair.facing,
+                    up: stair.up,
+                }));
                 plan.fixtures.extend(
                     chunk
                         .fixtures()
@@ -317,6 +390,10 @@ impl Plan for LocalPlan {
         } else {
             Vec2::ZERO
         }
+    }
+
+    fn stairs(&self) -> &[PlanStair] {
+        &self.stairs
     }
 }
 

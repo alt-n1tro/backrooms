@@ -5,8 +5,11 @@
 //! then push out of anything overlapped", which makes the player slide along
 //! walls instead of stopping dead.
 
-use bevy::math::Vec2;
+use backrooms_core::Edge;
+use bevy::math::{IVec2, Vec2};
 
+#[cfg(test)]
+use crate::space::PlanStair;
 use crate::space::{CELL, Plan, WALL_HALF, blocks};
 
 /// Longest distance moved before re-checking for collisions. Must be well
@@ -102,10 +105,45 @@ fn deepest_overlap(plan: &impl Plan, pos: Vec2, body: Body) -> Option<Vec2> {
     best.map(|(_, push)| push)
 }
 
+/// A doorway of a special kind that the player has just walked through.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crossing {
+    pub edge: Edge,
+    /// The cell whose west or south side the piece is on, relative to the
+    /// plan's base.
+    pub cell: IVec2,
+}
+
+/// Whether moving from `from` to `to` passed through a portal or a phasing
+/// wall piece: the two positions are on opposite sides of its line, within
+/// its length.
+pub fn crossed(plan: &impl Plan, from: Vec2, to: Vec2) -> Option<Crossing> {
+    let special = |edge: Edge| matches!(edge, Edge::Portal | Edge::Phase);
+    let through = |a: Vec2, b: Vec2| {
+        let along = b - a;
+        let (before, after) = (along.perp_dot(from - a), along.perp_dot(to - a));
+        let t = (to - a).dot(along) / along.length_squared();
+        before * after < 0.0 && (0.0..=1.0).contains(&t)
+    };
+    let cell = (to / CELL).floor();
+    let (cx, cy) = (cell.x as i32, cell.y as i32);
+    for y in cy - 2..=cy + 2 {
+        for x in cx - 2..=cx + 2 {
+            let (ns, ew) = (plan.slab_ns(x, y), plan.slab_ew(x, y));
+            if special(ns) && through(real(plan, x, y), real(plan, x, y + 1)) {
+                return Some(Crossing { edge: ns, cell: IVec2::new(x, y) });
+            }
+            if special(ew) && through(real(plan, x, y), real(plan, x + 1, y)) {
+                return Some(Crossing { edge: ew, cell: IVec2::new(x, y) });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use backrooms_core::Edge;
 
     /// A hand-written floor plan for tests.
     #[derive(Default)]
@@ -118,13 +156,21 @@ pub mod tests {
         /// Cells whose west side has a window, or a crawl hole.
         pub west_windows: Vec<(i32, i32)>,
         pub west_crawls: Vec<(i32, i32)>,
+        /// Cells whose west side is a portal, or a wall that is not there.
+        pub west_portals: Vec<(i32, i32)>,
+        pub west_phases: Vec<(i32, i32)>,
+        pub stairs: Vec<PlanStair>,
         /// Lattice points that are out of true, and by how many metres.
         pub skews: Vec<((i32, i32), Vec2)>,
     }
 
     impl Plan for TestPlan {
         fn west(&self, x: i32, y: i32) -> Edge {
-            if self.west_windows.contains(&(x, y)) {
+            if self.west_portals.contains(&(x, y)) {
+                Edge::Portal
+            } else if self.west_phases.contains(&(x, y)) {
+                Edge::Phase
+            } else if self.west_windows.contains(&(x, y)) {
                 Edge::Window
             } else if self.west_crawls.contains(&(x, y)) {
                 Edge::Crawl
@@ -142,6 +188,9 @@ pub mod tests {
         }
         fn condition(&self, _: i32, _: i32) -> Vec2 {
             Vec2::ZERO
+        }
+        fn stairs(&self) -> &[PlanStair] {
+            &self.stairs
         }
         fn skew(&self, x: i32, y: i32) -> Vec2 {
             self.skews.iter().find(|(at, _)| *at == (x, y)).map_or(Vec2::ZERO, |&(_, push)| push)
@@ -296,6 +345,28 @@ pub mod tests {
             pos = slide(&plan, pos, Vec2::ZERO, R);
         }
         assert_eq!(pos, Vec2::new(1.4, 2.7));
+    }
+
+    #[test]
+    fn portals_and_phasing_walls_let_you_through_and_say_so() {
+        let wall: Vec<(i32, i32)> = (-10..10).filter(|y| !(0..2).contains(y)).map(|y| (4, y)).collect();
+        for (edge, plan) in [
+            (Edge::Portal, TestPlan { west: wall.clone(), west_portals: vec![(4, 0), (4, 1)], ..Default::default() }),
+            (Edge::Phase, TestPlan { west: wall.clone(), west_phases: vec![(4, 0), (4, 1)], ..Default::default() }),
+        ] {
+            let (from, mid) = (Vec2::new(1.5, 0.3), Vec2::new(1.9, 0.3));
+            // Up to the line: nothing yet.
+            assert_eq!(crossed(&plan, from, mid), None);
+            let to = slide(&plan, mid, Vec2::new(0.3, 0.0), R);
+            assert!(to.x > 2.0, "{edge:?} blocked the way");
+            assert_eq!(crossed(&plan, mid, to), Some(Crossing { edge, cell: IVec2::new(4, 0) }));
+            // Carrying on does not report it again; coming back does.
+            assert_eq!(crossed(&plan, to, to + Vec2::new(0.3, 0.0)), None);
+            assert!(crossed(&plan, to, mid).is_some());
+            // Passing the ordinary wall beside it reports nothing (and is
+            // not possible anyway).
+            assert_eq!(crossed(&plan, Vec2::new(1.9, 2.3), Vec2::new(2.1, 2.3)), None);
+        }
     }
 
     #[test]

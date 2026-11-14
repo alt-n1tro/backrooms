@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use backrooms_core::generator::v1::golden;
 use backrooms_core::{
-    Address, CellPos, Chunk, ChunkPos, Edge, GenError, GeneratorVersion, LEVEL_COUNT, LevelId, generate_chunk,
+    Address, CellPos, Chunk, ChunkPos, Dir, Edge, GenError, GeneratorVersion, LEVEL_COUNT, LevelId, generate_chunk,
     level_info, zstack,
 };
 use clap::{Args, Parser, Subcommand};
@@ -82,6 +82,12 @@ enum Oddity {
     Crawl,
     /// A place where the walls are well out of true.
     Skew,
+    /// A dark doorway that leads somewhere far away on the same level.
+    Portal,
+    /// A piece of wall that is not there, and leads off the level.
+    Noclip,
+    /// A stairwell to another level.
+    Stairs,
 }
 
 /// A place to stand and a direction to face (degrees anticlockwise from
@@ -97,6 +103,23 @@ fn sightings(chunk: &Chunk, what: Oddity, found: &mut Vec<Sighting>) {
     let wanted = match what {
         Oddity::Window => Edge::Window,
         Oddity::Crawl => Edge::Crawl,
+        Oddity::Portal => Edge::Portal,
+        Oddity::Noclip => Edge::Phase,
+        Oddity::Stairs => {
+            if let Some(stair) = chunk.stair {
+                // Two bays out from the open side, looking back at it.
+                let (dx, dy) = stair.facing.step();
+                let stand = origin.offset(stair.x as i32 + 1 + dx * 6, stair.y as i32 + 1 + dy * 6);
+                let yaw = match stair.facing {
+                    Dir::North => 180,
+                    Dir::East => 90,
+                    Dir::South => 0,
+                    Dir::West => -90,
+                };
+                found.push(Sighting { stand, yaw });
+            }
+            return;
+        }
         Oddity::Skew => {
             // Only lattice points pushed at least 15 cm: less is hard to see.
             for (j, row) in chunk.skew.iter().enumerate().take(4) {

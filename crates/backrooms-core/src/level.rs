@@ -74,6 +74,22 @@ impl LevelGroup {
     }
 }
 
+/// What a level's surfaces are made of. The renderer picks its materials by
+/// this; the numbers are stable.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum Theme {
+    /// Patterned wallpaper, carpet, ceiling tiles.
+    #[default]
+    Yellow = 0,
+    /// Bare concrete throughout.
+    Concrete = 1,
+    /// Plain painted walls and hard-wearing grey carpet.
+    Office = 2,
+    /// Glazed tiles on floor and walls.
+    Tile = 3,
+}
+
 /// What a caller outside the generator needs to know about a level.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LevelInfo {
@@ -86,6 +102,9 @@ pub struct LevelInfo {
     pub built: bool,
     /// Floor-to-ceiling height in millimetres (0 while not built).
     pub ceiling_mm: u16,
+    pub theme: Theme,
+    /// Colour cast of the level's main surface, as sRGB.
+    pub tint: [u8; 3],
 }
 
 #[cfg(test)]

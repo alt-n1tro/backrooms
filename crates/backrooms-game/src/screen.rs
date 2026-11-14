@@ -80,6 +80,17 @@ pub struct Screen {
     adaptive: bool,
 }
 
+/// How black the screen is, from 0 (clear) to 1. Set to 1 to cut to black;
+/// it clears by itself. Used to hide the moment of arriving somewhere else.
+#[derive(Resource, Default)]
+pub struct Blackout(pub f32);
+
+#[derive(Component)]
+struct BlackoutOverlay;
+
+/// Seconds for a blackout to clear.
+const BLACKOUT_CLEARS_IN: f32 = 0.9;
+
 /// Highest frame rate to run at, or `None` for no limit.
 #[derive(Resource, Clone, Copy)]
 pub struct FrameCap(pub Option<f64>);
@@ -102,7 +113,9 @@ impl Plugin for ScreenPlugin {
         let adaptive = self.adaptive && self.scale == RenderScale::Auto;
         app.insert_resource(Screen { image, scale: self.scale, size, budget: PIXEL_BUDGET, adaptive })
             .add_systems(Startup, setup)
+            .init_resource::<Blackout>()
             .add_systems(Update, (adapt_to_frame_rate, fit_to_window, toggle_fullscreen).chain())
+            .add_systems(Update, clear_blackout)
             .add_systems(Last, limit_frame_rate);
     }
 }
@@ -116,6 +129,26 @@ fn setup(mut commands: Commands, screen: Res<Screen>) {
         Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default() },
         GlobalZIndex(-1),
     ));
+    // A black sheet over the 3D picture and under the HUD, normally clear.
+    commands.spawn((
+        BlackoutOverlay,
+        Node { position_type: PositionType::Absolute, width: percent(100), height: percent(100), ..default() },
+        BackgroundColor(Color::NONE),
+        GlobalZIndex(0),
+    ));
+}
+
+fn clear_blackout(
+    time: Res<Time>,
+    mut blackout: ResMut<Blackout>,
+    mut overlay: Single<&mut BackgroundColor, With<BlackoutOverlay>>,
+) {
+    if blackout.0 <= 0.0 && overlay.0.alpha() == 0.0 {
+        return;
+    }
+    // Hold full black for the first part, then lift quickly: an ease-out.
+    overlay.0 = Color::srgba(0.0, 0.0, 0.0, (blackout.0 * 1.6).min(1.0));
+    blackout.0 = (blackout.0 - time.delta_secs() / BLACKOUT_CLEARS_IN).max(0.0);
 }
 
 /// Frame-rate bookkeeping for [`adapt_to_frame_rate`].
