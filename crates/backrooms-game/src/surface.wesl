@@ -160,9 +160,11 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
     let height = in.world_position.y;
     let cells_per_pixel = max(length(fwidth(plan)), fwidth(height) * 2.0);
 
-    // The mesher stores moisture in red and wear in green.
+    // The mesher stores moisture in red, wear in green and baked light (in
+    // thousands of lux) in blue.
     let damp = in.color.r;
     let wear = in.color.g;
+    let lux = in.color.b * 1000.0;
 
     let n = in.world_normal;
     var look: Look;
@@ -178,6 +180,14 @@ fn fragment(in: VertexOutput, @builtin(front_facing) is_front: bool) -> Fragment
 
     pbr_input.material.base_color = vec4<f32>(look.color, 1.0);
     pbr_input.material.perceptual_roughness = look.roughness;
+
+    // Light from the steady panels was worked out when the chunk was built.
+    // A matt surface receiving E lux sends back colour * E / pi, tinted by
+    // the tube. It is passed on as "emissive" so that Bevy adds it to
+    // whatever the live lights (flickering tubes) contribute; the 1.0 in the
+    // last place makes camera exposure apply to it like any other light.
+    let tube = vec3<f32>(1.0, 0.93, 0.71);
+    pbr_input.material.emissive = vec4<f32>(look.color * tube * lux / 3.14159265, 1.0);
 
     var out: FragmentOutput;
     out.color = apply_pbr_lighting(pbr_input);

@@ -11,7 +11,9 @@
 //! -Z, and up is +Y. "Plan" coordinates in this crate are `Vec2(east, north)`
 //! in metres from the origin.
 
-use backrooms_core::{CellPos, Chunk, ChunkPos, Edge, GeneratorVersion, LevelId};
+use std::sync::{Arc, Mutex};
+
+use backrooms_core::{CellPos, Chunk, ChunkPos, Edge, GeneratorVersion, LevelId, LightState};
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
@@ -53,64 +55,82 @@ pub fn world_to_plan(world: Vec3) -> Vec2 {
     Vec2::new(world.x, -world.z)
 }
 
-/// The generated chunks currently held in memory.
+/// The generated chunks currently held in memory, shared between threads.
 ///
 /// This is only a cache: any chunk can be dropped and regenerated, and will
-/// come back identical.
-#[derive(Resource)]
-pub struct ChunkStore {
-    pub version: GeneratorVersion,
-    pub level: LevelId,
-    chunks: HashMap<ChunkPos, Chunk>,
+/// come back identical. When it is full, the chunks that have gone longest
+/// without being asked for are dropped (a "least recently used" cache).
+///
+/// `Arc` is a reference-counted pointer that may be shared across threads;
+/// cloning a `ChunkCache` or an `Arc<Chunk>` copies the pointer, not the
+/// data. `Mutex` lets only one thread touch the map at a time.
+#[derive(Resource, Clone)]
+pub struct ChunkCache(Arc<CacheInner>);
+
+struct CacheInner {
+    version: GeneratorVersion,
+    level: LevelId,
+    capacity: usize,
+    map: Mutex<CacheMap>,
 }
 
-impl ChunkStore {
-    pub fn new(version: GeneratorVersion, level: LevelId) -> Self {
-        Self { version, level, chunks: HashMap::default() }
+#[derive(Default)]
+struct CacheMap {
+    /// Each chunk with the time it was last asked for.
+    chunks: HashMap<ChunkPos, (Arc<Chunk>, u64)>,
+    /// Counts requests; stands in for a clock.
+    clock: u64,
+}
+
+impl ChunkCache {
+    pub fn new(version: GeneratorVersion, level: LevelId, capacity: usize) -> Self {
+        Self(Arc::new(CacheInner { version, level, capacity: capacity.max(16), map: Mutex::default() }))
     }
 
-    /// Makes sure the chunk at `pos` is generated.
-    pub fn ensure(&mut self, pos: ChunkPos) {
-        self.chunks.entry(pos).or_insert_with(|| {
-            backrooms_core::generate_chunk(self.version, self.level, pos)
-                .expect("the game only runs on levels that are built")
-        });
-    }
-
-    /// Makes sure `pos` and its eight neighbours are generated.
-    pub fn ensure_around(&mut self, pos: ChunkPos) {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                self.ensure(pos.offset(dx, dy));
+    /// The chunk at `pos`, generated now if it is not in memory.
+    pub fn get(&self, pos: ChunkPos) -> Arc<Chunk> {
+        let inner = &*self.0;
+        {
+            // The lock is released at the end of this block, before the slow
+            // part, so other threads are not held up while a chunk generates.
+            let mut map = inner.map.lock().expect("no thread panics while holding the cache");
+            map.clock += 1;
+            let now = map.clock;
+            if let Some((chunk, used)) = map.chunks.get_mut(&pos) {
+                *used = now;
+                return chunk.clone();
             }
         }
-    }
-
-    pub fn get(&self, pos: ChunkPos) -> Option<&Chunk> {
-        self.chunks.get(&pos)
-    }
-
-    /// Drops every chunk for which `keep` returns false.
-    pub fn retain(&mut self, mut keep: impl FnMut(ChunkPos) -> bool) {
-        self.chunks.retain(|&pos, _| keep(pos));
+        let chunk = Arc::new(
+            backrooms_core::generate_chunk(inner.version, inner.level, pos)
+                .expect("the game only runs on levels that are built"),
+        );
+        let mut map = inner.map.lock().expect("no thread panics while holding the cache");
+        let now = map.clock;
+        // Two threads may have generated the same chunk at once. Both results
+        // are identical, so it does not matter which one is kept.
+        map.chunks.insert(pos, (chunk.clone(), now));
+        if map.chunks.len() > inner.capacity {
+            // Drop the stalest eighth in one go, so this scan is rare.
+            let mut ages: Vec<u64> = map.chunks.values().map(|&(_, used)| used).collect();
+            let cut = ages.len() / 8;
+            let (_, &mut threshold, _) = ages.select_nth_unstable(cut);
+            map.chunks.retain(|_, &mut (_, used)| used > threshold);
+        }
+        chunk
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.chunks.len()
-    }
-
-    /// A window onto the floor plan with cell `(0, 0)` at `base`.
-    pub fn plan(&self, base: CellPos) -> StorePlan<'_> {
-        StorePlan { store: self, base }
+        self.0.map.lock().expect("no thread panics while holding the cache").chunks.len()
     }
 }
 
 /// Read access to the floor plan in coordinates relative to some base cell.
 ///
-/// Both the mesher (base = chunk corner) and the collision code (base =
-/// render origin) work through this trait, so they can never disagree about
-/// where a wall is. Tests implement it with a hand-written plan.
+/// The mesher, the light baker and the collision code all work through this
+/// trait, so they can never disagree about where a wall is. Tests implement
+/// it with a hand-written plan.
 pub trait Plan {
     /// Whether the core has a wall on the west side of cell `(x, y)`.
     fn edge_west(&self, x: i32, y: i32) -> bool;
@@ -136,39 +156,117 @@ pub trait Plan {
     }
 }
 
-/// A [`Plan`] backed by the chunk store. Cells whose chunk is not in memory
-/// read as empty floor, so callers `ensure` what they need first.
-pub struct StorePlan<'a> {
-    store: &'a ChunkStore,
-    base: CellPos,
+/// Cells along one side of a chunk.
+const N: i32 = backrooms_core::coord::CHUNK_SIZE;
+/// Cells along one side of a [`LocalPlan`]: three chunks, plus one for the
+/// far boundary edges.
+const SPAN: i32 = 3 * N + 1;
+
+const WEST: u8 = 1;
+const SOUTH: u8 = 2;
+const SOLID: u8 = 4;
+
+/// A ceiling fixture as seen from a [`LocalPlan`].
+#[derive(Clone, Copy, Debug)]
+pub struct PlanFixture {
+    /// South-west cell of the panel, relative to the plan's base. The panel
+    /// also covers the cell east of it.
+    pub cell: IVec2,
+    pub state: LightState,
 }
 
-impl StorePlan<'_> {
-    fn look<T: Default>(&self, x: i32, y: i32, read: impl FnOnce(&Chunk, usize, usize) -> T) -> T {
-        let cell = self.base.offset(x, y);
-        let (lx, ly) = cell.local();
-        self.store.get(cell.chunk()).map(|chunk| read(chunk, lx, ly)).unwrap_or_default()
+/// A flat copy of the floor plan of one chunk and its eight neighbours.
+///
+/// Cell `(0, 0)` is the south-west cell of the middle chunk, and cells from
+/// -16 to 31 on each axis are covered. Everything is in plain arrays, so
+/// lookups cost a few nanoseconds: the light baker makes hundreds of
+/// thousands of them per chunk. Cells outside read as empty floor.
+pub struct LocalPlan {
+    /// The cell that is `(0, 0)` here.
+    pub base: CellPos,
+    flags: Vec<u8>,
+    condition: Vec<[u8; 2]>,
+    pub fixtures: Vec<PlanFixture>,
+}
+
+impl LocalPlan {
+    pub fn around(cache: &ChunkCache, centre: ChunkPos) -> Self {
+        let mut plan = Self {
+            base: centre.origin(),
+            flags: vec![0; (SPAN * SPAN) as usize],
+            condition: vec![[0; 2]; (SPAN * SPAN) as usize],
+            fixtures: Vec::new(),
+        };
+        for cy in -1..=1 {
+            for cx in -1..=1 {
+                let chunk = cache.get(centre.offset(cx, cy));
+                let corner = IVec2::new(cx, cy) * N;
+                // Index 16 of a chunk's edge arrays is its far boundary. It
+                // is the same edge as index 0 of the next chunk, so writing
+                // both is harmless, and on the outer rim it is the only copy.
+                for ly in 0..=N {
+                    for lx in 0..=N {
+                        let (ux, uy) = (lx as usize, ly as usize);
+                        let mut flags = 0;
+                        if ly < N && chunk.west[uy][ux] == Edge::Wall {
+                            flags |= WEST;
+                        }
+                        if lx < N && chunk.south[uy][ux] == Edge::Wall {
+                            flags |= SOUTH;
+                        }
+                        let index = Self::index(corner.x + lx, corner.y + ly).expect("inside the plan");
+                        if lx < N && ly < N {
+                            let cell = chunk.cells[uy][ux];
+                            if cell.solid {
+                                flags |= SOLID;
+                            }
+                            plan.condition[index] = [cell.damp, cell.wear];
+                            // A cell's own entry: replace whatever boundary
+                            // copy a neighbour wrote earlier.
+                            plan.flags[index] = flags;
+                        } else {
+                            // A boundary copy: add to it, never erase.
+                            plan.flags[index] |= flags;
+                        }
+                    }
+                }
+                plan.fixtures.extend(
+                    chunk
+                        .fixtures()
+                        .iter()
+                        .map(|f| PlanFixture { cell: corner + IVec2::new(f.x as i32, f.y as i32), state: f.state }),
+                );
+            }
+        }
+        plan
+    }
+
+    fn index(x: i32, y: i32) -> Option<usize> {
+        let (gx, gy) = (x + N, y + N);
+        ((0..SPAN).contains(&gx) && (0..SPAN).contains(&gy)).then(|| (gy * SPAN + gx) as usize)
+    }
+
+    fn flag(&self, x: i32, y: i32, flag: u8) -> bool {
+        Self::index(x, y).is_some_and(|i| self.flags[i] & flag != 0)
     }
 }
 
-impl Plan for StorePlan<'_> {
+impl Plan for LocalPlan {
     fn edge_west(&self, x: i32, y: i32) -> bool {
-        self.look(x, y, |c, lx, ly| c.west[ly][lx] == Edge::Wall)
+        self.flag(x, y, WEST)
     }
 
     fn edge_south(&self, x: i32, y: i32) -> bool {
-        self.look(x, y, |c, lx, ly| c.south[ly][lx] == Edge::Wall)
+        self.flag(x, y, SOUTH)
     }
 
     fn solid(&self, x: i32, y: i32) -> bool {
-        self.look(x, y, |c, lx, ly| c.cells[ly][lx].solid)
+        self.flag(x, y, SOLID)
     }
 
     fn condition(&self, x: i32, y: i32) -> Vec2 {
-        self.look(x, y, |c, lx, ly| {
-            let cell = c.cells[ly][lx];
-            Vec2::new(cell.damp as f32, cell.wear as f32) / 255.0
-        })
+        Self::index(x, y)
+            .map_or(Vec2::ZERO, |i| Vec2::new(self.condition[i][0] as f32, self.condition[i][1] as f32) / 255.0)
     }
 }
 
@@ -206,21 +304,65 @@ mod tests {
     }
 
     #[test]
-    fn store_plan_matches_the_core() {
-        let mut store = ChunkStore::new(GeneratorVersion::V1, LevelId::ZERO);
-        let pos = ChunkPos::new(-3, 7);
-        store.ensure_around(pos);
-        assert_eq!(store.len(), 9);
-        let chunk = store.get(pos).unwrap().clone();
-        let plan = store.plan(pos.origin());
-        for y in 0..16 {
-            for x in 0..16 {
-                assert_eq!(plan.edge_west(x, y), chunk.west[y as usize][x as usize] == Edge::Wall);
-                assert_eq!(plan.edge_south(x, y), chunk.south[y as usize][x as usize] == Edge::Wall);
-                assert_eq!(plan.solid(x, y), chunk.cells[y as usize][x as usize].solid);
+    fn local_plan_matches_the_core() {
+        let cache = ChunkCache::new(GeneratorVersion::V1, LevelId::ZERO, 64);
+        for centre in [ChunkPos::new(-3, 7), ChunkPos::new(ChunkPos::MAX, ChunkPos::MIN)] {
+            let plan = LocalPlan::around(&cache, centre);
+            for cy in -1..=1 {
+                for cx in -1..=1 {
+                    let chunk = cache.get(centre.offset(cx, cy));
+                    for ly in 0..16 {
+                        for lx in 0..16 {
+                            let (x, y) = (cx * 16 + lx, cy * 16 + ly);
+                            let (ux, uy) = (lx as usize, ly as usize);
+                            assert_eq!(plan.edge_west(x, y), chunk.west[uy][ux] == Edge::Wall, "west {x},{y}");
+                            assert_eq!(plan.edge_south(x, y), chunk.south[uy][ux] == Edge::Wall, "south {x},{y}");
+                            assert_eq!(plan.solid(x, y), chunk.cells[uy][ux].solid, "solid {x},{y}");
+                        }
+                        // The far boundary of the outermost chunks is covered too.
+                        let (ux, far) = (ly as usize, 16usize);
+                        assert_eq!(plan.edge_west(cx * 16 + 16, cy * 16 + ly), chunk.west[ux][far] == Edge::Wall);
+                        assert_eq!(plan.edge_south(cx * 16 + ly, cy * 16 + 16), chunk.south[far][ux] == Edge::Wall);
+                    }
+                }
             }
-            // Column 16 of this chunk is column 0 of the eastern neighbour.
-            assert_eq!(plan.edge_west(16, y), chunk.west[y as usize][16] == Edge::Wall);
+            let expected: usize = (-1..=1)
+                .flat_map(|cy| (-1..=1).map(move |cx| (cx, cy)))
+                .map(|(cx, cy)| cache.get(centre.offset(cx, cy)).fixtures().len())
+                .sum();
+            assert_eq!(plan.fixtures.len(), expected);
+            // Outside the three-by-three block everything is open floor.
+            assert!(!plan.edge_west(-17, 0) && !plan.solid(40, 40));
         }
+    }
+
+    #[test]
+    fn the_cache_forgets_the_oldest_chunks_and_regenerates_them_identically() {
+        let cache = ChunkCache::new(GeneratorVersion::V1, LevelId::ZERO, 16);
+        let first = cache.get(ChunkPos::new(0, 0));
+        for i in 1..200 {
+            cache.get(ChunkPos::new(i, 0));
+            // Asking for a chunk keeps it fresh.
+            cache.get(ChunkPos::new(1, 0));
+        }
+        assert!(cache.len() <= 17, "cache grew to {}", cache.len());
+        // Chunk 0,0 was evicted long ago; it comes back the same.
+        assert_eq!(*cache.get(ChunkPos::new(0, 0)), *first);
+    }
+
+    #[test]
+    fn the_cache_is_safe_to_share_between_threads() {
+        let cache = ChunkCache::new(GeneratorVersion::V1, LevelId::ZERO, 64);
+        let reference: Vec<u64> = (0..40).map(|i| cache.get(ChunkPos::new(i, -i)).digest()).collect();
+        std::thread::scope(|scope| {
+            for t in 0..4 {
+                let (cache, reference) = (cache.clone(), &reference);
+                scope.spawn(move || {
+                    for i in (0..40).rev().cycle().skip(t * 7).take(120) {
+                        assert_eq!(cache.get(ChunkPos::new(i, -i)).digest(), reference[i as usize]);
+                    }
+                });
+            }
+        });
     }
 }

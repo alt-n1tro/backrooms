@@ -4,7 +4,7 @@ A first-person exploration of the Backrooms in which the whole world is a
 pure function of its coordinates: nothing is stored, and the same address is
 the same place on every machine.
 
-Current version: **0.2.0** (milestone 2 of 9: walkable Level 0). See
+Current version: **0.3.0** (milestone 3 of 9: performance pass). See
 [CHANGELOG.md](CHANGELOG.md).
 
 ![Level 0 at the origin](docs/level0-walk.png)
@@ -39,7 +39,10 @@ take seconds.
 |---|---|
 | Click | Capture the mouse and look around |
 | W A S D or arrows | Walk |
-| Shift | Run |
+| W twice, then hold (or Shift) | Sprint |
+| Space | Jump |
+| F11 | Fullscreen |
+| F3 | Show frame rate and render size |
 | Escape | Release the mouse |
 
 Where to start:
@@ -56,15 +59,20 @@ cargo run --release -p backrooms-game -- --x 2000000000 --y -2000000000
 cargo run --release -p backrooms-game -- --random
 ```
 
-If it runs slowly, draw less far and use the cheaper lights:
+The 3D view is drawn at up to about 1080p and stretched to fit larger
+windows. If it still runs slowly, press F3 to see the frame rate, then draw
+fewer pixels and less far:
 
 ```bash
-cargo run --release -p backrooms-game -- --view 3 --lights point
+cargo run --release -p backrooms-game -- --render-scale 0.5 --view 3
 ```
 
-`--help` lists everything, including `--size`, `--yaw`, `--pitch` and
-`--screenshot <file.png>`, which saves one picture of the starting view and
-quits.
+For the sharpest picture on a fast GPU, use `--render-scale 1`.
+
+Other options: `--sensitivity 1.5` (mouse speed), `--hum 0` (silence the
+lights), `--fps 60` (frame-rate cap, default 120), `--vsync`. `--help` lists
+everything, including `--screenshot <file.png>`, which saves one picture of
+the starting view and quits.
 
 ## Look at the map
 

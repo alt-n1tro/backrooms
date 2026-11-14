@@ -4,9 +4,10 @@
 //! hums at twice the mains frequency (the ballast flexes on every half
 //! cycle), with a stack of harmonics and a papery buzz on top.
 //!
-//! Milestone 2 plays one hum whose loudness follows how many lit tubes are
-//! near the player. Placing a separate source at each fixture comes with the
-//! audio milestone.
+//! One hum is played, and its loudness follows how many lit tubes are near
+//! the player. It is meant to sit at the edge of hearing: something you
+//! notice mostly when it stops. Placing a separate source at each fixture
+//! comes with the audio milestone.
 
 use std::f32::consts::TAU;
 use std::time::Duration;
@@ -20,8 +21,13 @@ use crate::player::Player;
 const SAMPLE_RATE: u32 = 44_100;
 /// Mains frequency in hertz. The hum sits at twice this.
 const MAINS: f32 = 60.0;
-/// Loudness with a lit panel directly overhead.
-const FULL: f32 = 0.5;
+/// Loudness scale of the hum, as a fraction of full volume. Kept very low
+/// on purpose: the hum is background, not a sound effect.
+const FULL: f32 = 0.035;
+
+/// The player's own multiplier on the hum's loudness.
+#[derive(Resource, Clone, Copy)]
+pub struct HumVolume(pub f32);
 
 /// The sound itself is the same everywhere, so the asset carries no data.
 #[derive(Asset, TypePath)]
@@ -120,6 +126,7 @@ pub fn loudness(fixtures: impl Iterator<Item = (f32, f32)>) -> f32 {
 
 fn follow_the_lights(
     time: Res<Time>,
+    volume: Res<HumVolume>,
     player: Single<&Transform, With<Player>>,
     fixtures: Query<(&GlobalTransform, &FixtureLight)>,
     mut sink: Single<&mut AudioSink, With<HumPlayer>>,
@@ -134,7 +141,7 @@ fn follow_the_lights(
     // Glide rather than jump, except that a flickering tube overhead should
     // be heard to stutter: a short time constant does both.
     *current += (target - *current) * (1.0 - (-18.0 * time.delta_secs()).exp());
-    sink.set_volume(Volume::Linear(*current));
+    sink.set_volume(Volume::Linear(*current * volume.0));
 }
 
 #[cfg(test)]
@@ -165,7 +172,9 @@ mod tests {
         assert_eq!(loudness(std::iter::empty()), 0.0);
         let one = loudness([(1.0, 1.0)].into_iter());
         let many = loudness((0..12).map(|i| (1.0 + i as f32, 1.0)));
-        assert!(one > 0.1 && many > one && many <= FULL * 1.6);
+        assert!(one > 0.0 && many > one && many <= FULL * 1.6);
+        // Even at its loudest the hum stays far below full volume.
+        assert!(many < 0.08);
         assert!(loudness([(1.0, 0.25)].into_iter()) < one);
     }
 }

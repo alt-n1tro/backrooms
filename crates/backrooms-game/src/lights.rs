@@ -3,12 +3,20 @@
 //! Where the fixtures are, which are dead and which flicker comes from the
 //! core. What a flicker looks like from moment to moment is decided here, as
 //! a pure function of the fixture's seed and the clock.
+//!
+//! The light of a steady panel is baked into the chunk mesh (see
+//! [`crate::bake`]), so a steady fixture is only a glowing rectangle here.
+//! Flickering fixtures cannot be baked, because they change; each of those
+//! gets a real light that the GPU evaluates every frame. They are a few
+//! percent of all fixtures, which is what makes this affordable.
 
 use backrooms_core::LightState;
 use backrooms_core::hash::Key;
 use bevy::prelude::*;
 
-/// How the light a fixture casts is computed.
+use crate::bake::LUMENS;
+
+/// How the light of a flickering fixture is computed.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
 pub enum LightKind {
     /// A glowing rectangle the size of the panel. Soft, correct, costlier.
@@ -17,13 +25,12 @@ pub enum LightKind {
     Point,
 }
 
-/// Luminous output of one lit panel.
-const LUMENS: f32 = 5200.0;
 /// A point light throws its output in every direction, a panel only
 /// downwards, so the point version needs more to light the floor equally.
 const POINT_BOOST: f32 = 7.0;
-/// Beyond this distance a fixture lights nothing. Shorter is faster.
-const RANGE: f32 = 5.5;
+/// Beyond this distance a flickering fixture lights nothing. Shorter is
+/// faster.
+const RANGE: f32 = 6.0;
 /// The panel is 1.0 m x 0.5 m; the glowing part is a little smaller.
 pub const PANEL: Vec2 = Vec2::new(0.92, 0.42);
 /// Slightly cool white, like a cheap tube.
@@ -94,7 +101,8 @@ pub fn spawn_fixture(
             ChildOf(chunk),
         ))
         .id();
-    if !lit {
+    // Only a flickering tube needs a live light; see the module docs.
+    if state != LightState::Flicker {
         return;
     }
     // The light is a child of the panel, a few centimetres in front of it

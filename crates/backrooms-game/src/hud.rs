@@ -4,6 +4,7 @@ use backrooms_core::{Address, level_info, zstack};
 use bevy::prelude::*;
 
 use crate::player::Player;
+use crate::screen::Screen;
 use crate::space::{RenderOrigin, world_to_plan};
 
 #[derive(Component)]
@@ -48,12 +49,56 @@ fn setup(mut commands: Commands) {
     ));
 }
 
+/// The F3 line: frame rate and the size the 3D picture is drawn at.
+pub fn stats(frame_seconds: f32, picture: UVec2, window: UVec2) -> String {
+    let fps = if frame_seconds > 0.0 { (1.0 / frame_seconds).round() } else { 0.0 };
+    let percent = (picture.x as f32 / window.x.max(1) as f32 * 100.0).round();
+    format!("{fps} fps | {:.1} ms | drawn at {} x {} ({percent}%)", frame_seconds * 1000.0, picture.x, picture.y)
+}
+
+/// What the HUD remembers between frames. `Local<T>` gives a system private
+/// state that lives as long as the app; grouping it in one struct keeps the
+/// parameter list short.
+#[derive(Default)]
+struct StatsState {
+    visible: bool,
+    /// Running average of the frame time, in seconds.
+    average: f32,
+    /// The value currently on screen, refreshed a few times a second so the
+    /// number can be read rather than flickering.
+    shown: f32,
+    since_refresh: f32,
+}
+
+// A system's parameters are its declared inputs, so a long list here is
+// information rather than clutter.
+#[allow(clippy::too_many_arguments)]
 fn update(
     origin: Res<RenderOrigin>,
+    screen: Res<Screen>,
+    time: Res<Time<Real>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window>,
     player: Single<&Transform, With<Player>>,
     mut text: Single<&mut Text, With<Readout>>,
+    mut state: Local<StatsState>,
 ) {
-    let wanted = readout(&address_at(&origin, player.translation));
+    if keys.just_pressed(KeyCode::F3) {
+        state.visible = !state.visible;
+    }
+    let dt = time.delta_secs();
+    state.average += (dt - state.average) * 0.05;
+    state.since_refresh += dt;
+    if state.since_refresh > 0.25 {
+        state.since_refresh = 0.0;
+        state.shown = state.average;
+    }
+
+    let mut wanted = readout(&address_at(&origin, player.translation));
+    if state.visible {
+        wanted.push('\n');
+        wanted.push_str(&stats(state.shown, screen.size, window.physical_size()));
+    }
     // Comparing first avoids re-laying-out the text on frames where the
     // player has not crossed into another cell.
     if text.0 != wanted {
@@ -71,6 +116,14 @@ mod tests {
         let address = Address { version: GeneratorVersion::V1, level: LevelId::ZERO, cell: CellPos::new(12, -5) };
         let depth = zstack::depth_of(GeneratorVersion::V1, LevelId::ZERO);
         assert_eq!(readout(&address), format!("v1 | LEVEL 0 | X 12 | Y -5 | Z {depth}"));
+    }
+
+    #[test]
+    fn stats_line_reads_naturally() {
+        let line = stats(1.0 / 60.0, UVec2::new(1832, 1145), UVec2::new(2880, 1800));
+        assert_eq!(line, "60 fps | 16.7 ms | drawn at 1832 x 1145 (64%)");
+        // Before the first frame there is nothing to divide by.
+        assert!(stats(0.0, UVec2::ONE, UVec2::ZERO).starts_with("0 fps"));
     }
 
     #[test]
